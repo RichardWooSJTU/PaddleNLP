@@ -32,7 +32,7 @@ def parse_args():
     )
     parser.add_argument(
         "--model_path",
-        default="/root/paddlejob/workspace/env_run/fhq/models/glm/checkpoint-100/",
+        default="output_generate/splits_mp_01_sharding_01_500/",
         type=str,
         required=False,
         help="Path of the trained model to be exported.",
@@ -50,8 +50,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    token_path = "/root/.paddlenlp/models/THUDM/glm-10b-chinese"
+    
+    tokenizer = AutoTokenizer.from_pretrained(token_path)
     model = AutoModelForConditionalGeneration.from_pretrained(args.model_path)
 
     model.eval()
