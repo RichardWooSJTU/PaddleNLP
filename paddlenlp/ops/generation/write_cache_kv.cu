@@ -150,9 +150,9 @@ void LaunchWriteCacheKV(const paddle::Tensor& input_k,
 }
 
 void WriteCacheKV(const paddle::Tensor& input_k,
-                                         const paddle::Tensor& input_v,
-                                         const paddle::Tensor& cache_kv,
-                                         const paddle::Tensor& sequence_lengths_shape) {
+                  const paddle::Tensor& input_v,
+                  const paddle::Tensor& cache_kv,
+                  const paddle::Tensor& sequence_lengths_shape) {
     switch (cache_kv.type()) {
         case paddle::DataType::BFLOAT16: {
             return LaunchWriteCacheKV<paddle::DataType::BFLOAT16>(

@@ -15,7 +15,7 @@
 from paddle.utils.cpp_extension import CUDAExtension, setup
 
 setup(
-    name="custom_setup_ops",
+    name="paddlenlp_ops",
     ext_modules=CUDAExtension(
         sources=[
             "save_with_output.cc",

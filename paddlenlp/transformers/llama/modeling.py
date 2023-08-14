@@ -23,7 +23,7 @@ import numpy as np
 import paddle
 import paddle.distributed.fleet.meta_parallel as mpu
 import paddle.nn.functional as F
-from custom_setup_ops import fused_get_rotary_embedding, get_padding_offset
+from paddlenlp_ops import fused_get_rotary_embedding, get_padding_offset
 from paddle import Tensor, nn
 from paddle.distributed import fleet
 from paddle.distributed.fleet.utils import recompute

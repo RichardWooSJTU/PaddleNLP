@@ -22,7 +22,7 @@ from typing import Union
 import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
-from custom_setup_ops import (
+from paddlenlp_ops import (
     get_token_penalty_multi_scores,
     save_with_output,
     set_mask_value,

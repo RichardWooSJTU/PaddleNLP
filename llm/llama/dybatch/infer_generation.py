@@ -14,7 +14,7 @@
 
 import os
 
-import custom_setup_ops
+import paddlenlp_ops
 import numpy as np
 import paddle
 import paddle.distributed as dist
@@ -128,7 +128,7 @@ class Predictor(object):
         infer_model_path = get_infer_model_path(args.model_dir, args.model_prefix)
 
         config = paddle.inference.Config(infer_model_path + ".pdmodel", infer_model_path + ".pdiparams")
-        
+
         config.switch_ir_optim(True)
         device_id = int(os.environ.get("FLAGS_selected_gpus", 0))
         config.enable_use_gpu(100, device_id)

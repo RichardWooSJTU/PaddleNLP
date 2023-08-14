@@ -14,7 +14,7 @@
 
 import paddle
 import paddle.distributed as dist
-from custom_setup_ops import (
+from paddlenlp_ops import (
     encode_rotary_qk,
     qkv_transpose_split,
     rebuild_padding,
@@ -68,48 +68,47 @@ def fused_act_bias_wrapper(
             quant_max_bound,
             quant_min_bound,
         )
+    helper = LayerHelper("fused_bias_act")
+    if x.dtype == "int32":
+        if compute_dtype == "bf16":
+            dtype = "uint16"
+        elif compute_dtype == "fp16":
+            dtype = "float16"
+        elif compute_dtype == "fp32":
+            dtype = "float32"
+        out = helper.create_variable_for_type_inference(dtype=dtype)
     else:
-        helper = LayerHelper("fused_bias_act")
-        if x.dtype == "int32":
-            if compute_dtype == "bf16":
-                dtype = "uint16"
-            elif compute_dtype == "fp16":
-                dtype = "float16"
-            elif compute_dtype == "fp32":
-                dtype = "float32"
-            out = helper.create_variable_for_type_inference(dtype=dtype)
-        else:
-            out = helper.create_variable_for_type_inference(dtype=x.dtype)
+        out = helper.create_variable_for_type_inference(dtype=x.dtype)
 
-        inputs = {}
-        inputs["x"] = x
-        if bias is not None:
-            inputs["bias"] = bias
-        if dequant_scales is not None:
-            inputs["bias"] = dequant_scales
+    inputs = {}
+    inputs["x"] = x
+    if bias is not None:
+        inputs["bias"] = bias
+    if dequant_scales is not None:
+        inputs["bias"] = dequant_scales
 
-        if shift is not None:
-            inputs["shift"] = shift
+    if shift is not None:
+        inputs["shift"] = shift
 
-        if smooth is not None:
-            inputs["smooth"] = smooth
+    if smooth is not None:
+        inputs["smooth"] = smooth
 
-        attrs = {
-            "act_method": act_method,
-            "compute_dtype": compute_dtype,
-            "quant_scale": quant_scale,
-            "quant_round_type": quant_round_type,
-            "quant_max_bound": quant_max_bound,
-            "quant_min_bound": quant_min_bound,
-        }
+    attrs = {
+        "act_method": act_method,
+        "compute_dtype": compute_dtype,
+        "quant_scale": quant_scale,
+        "quant_round_type": quant_round_type,
+        "quant_max_bound": quant_max_bound,
+        "quant_min_bound": quant_min_bound,
+    }
 
-        helper.append_op(
-            type="fused_bias_act",
-            inputs=inputs,
-            outputs={"out": out},
-            attrs=attrs,
-        )
-        return out
+    helper.append_op(
+        type="fused_bias_act",
+        inputs=inputs,
+        outputs={"out": out},
+        attrs=attrs,
+    )
+    return out
 
 
 def norm_helper(
