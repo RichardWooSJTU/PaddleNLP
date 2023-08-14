@@ -15,7 +15,7 @@
 export PYTHONPATH=$PYTHONPATH:../../..
 
 python -m paddle.distributed.launch --gpus "0,1,2,3,4,5,6,7" \
-           export_generation_model.py \
+           export_model.py \
            --model_name_or_dir=${1} \
            --model_dtype=float16 \
            --output_dir=${2} \

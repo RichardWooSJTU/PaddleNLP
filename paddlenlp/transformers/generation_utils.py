@@ -43,6 +43,14 @@ try:
 except:
     is_top_p_sampling_avaliable = False
 
+if not is_top_p_sampling_avaliable:
+    try:
+        from paddlenlp_ops import top_p_sampling
+
+        is_top_p_sampling_avaliable = True
+    except:
+        is_top_p_sampling_avaliable = False
+
 from paddlenlp.utils.log import logger
 
 from .model_outputs import ModelOutput

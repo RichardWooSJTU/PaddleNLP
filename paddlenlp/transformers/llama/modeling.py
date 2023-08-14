@@ -28,7 +28,7 @@ from paddle import Tensor, nn
 from paddle.distributed import fleet
 from paddle.distributed.fleet.utils import recompute
 
-from paddlenlp.transformers.fused_multi_transformer_fine_grained import (
+from paddlenlp.transformers.fused_transformer_layers import (
     FusedMultiTransformer,
 )
 

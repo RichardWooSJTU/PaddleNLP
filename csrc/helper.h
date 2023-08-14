@@ -15,6 +15,8 @@
 #pragma once
 
 #include "paddle/extension.h"
+#include <cub/cub.cuh>
+#include <curand_kernel.h>
 
 constexpr int kBlockSize = 256; 
 constexpr int kNumWaves = 16; 

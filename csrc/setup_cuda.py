@@ -30,6 +30,7 @@ setup(
             "transpose_removing_padding.cu",
             "write_cache_kv.cu",
             "encode_rotary_qk.cu",
+            "top_p_sampling.cu",
         ]
     ),
 )
