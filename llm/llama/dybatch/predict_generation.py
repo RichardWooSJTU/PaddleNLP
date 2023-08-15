@@ -37,6 +37,7 @@ def parse_arguments():
     parser.add_argument("--batch_size", type=int, default=4, help="The batch size of data.")
     parser.add_argument("--src_length", type=int, default=1024, help="The batch size of data.")
     parser.add_argument("--tgt_length", type=int, default=100, help="The batch size of data.")
+    parser.add_argument("--is_static_int8", type=bool, default=False, help="The batch size of data.")
     return parser.parse_args()
 
 
@@ -65,7 +66,7 @@ class Predictor(object):
         self.config.dtype = "float16"
         dtype = "float16" if self.config.dtype is None else self.config.dtype
         paddle.set_default_dtype(dtype)
-        self.model = LlamaForCausalLMDyBatch.from_pretrained(args.model_name_or_path, config=self.config)
+        self.model = LlamaForCausalLMDyBatch.from_pretrained(args.model_name_or_path, config=self.config, is_static_int8=args.is_static_int8)
 
         self.model.eval()
 

@@ -20,6 +20,8 @@ from functools import partial
 from typing import Optional, Tuple
 
 import numpy as np
+import json
+import os
 import paddle
 import paddle.distributed.fleet.meta_parallel as mpu
 import paddle.nn.functional as F
@@ -30,6 +32,11 @@ from paddle.distributed.fleet.utils import recompute
 
 from paddlenlp.transformers.fused_transformer_layers import (
     FusedMultiTransformer,
+)
+
+from paddlenlp.transformers.fused_transformer_layers_int8 import (
+    FusedMultiTransformer,
+    FusedMultiTransformerInt8,
 )
 
 try:
@@ -1148,6 +1155,62 @@ class FusedLlamaRMSNorm(nn.Layer):
             hidden_states, self.weight, None, self.variance_epsilon, begin_norm_axis=1
         )
 
+class load_act_scale_json:
+    def __init__(
+        self,
+        scale_json_file_path="act_scales.json",
+        key_map_dict=None,
+        num_of_layers=None,
+    ):
+        with open(scale_json_file_path) as json_file:
+            self.scale_dict = json.load(json_file)
+        self.key_map = key_map_dict
+        self.scale = {}
+        for scale_type, key_template in self.key_map.items():
+            self.scale[scale_type] = np.full([num_of_layers], fill_value=-1.0)
+            for i in range(num_of_layers):
+                if key_template.replace("#", str(i)) in self.scale_dict.keys():
+                    self.scale[scale_type][i] = (
+                        1 / self.scale_dict[key_template.replace("#", str(i))]
+                    )
+
+
+class load_weight_scale_json:
+    def __init__(
+        self,
+        scale_json_file_path="weight_scales.json",
+        key_map_dict=None,
+        num_of_layers=None,
+    ):
+        with open(scale_json_file_path) as json_file:
+            self.scale_dict = json.load(json_file)
+        self.key_map = key_map_dict
+        self.scale = {}
+        for scale_type, key_template in self.key_map.items():
+            # import pdb;pdb.set_trace()
+            no_skip_layer_list = []
+            n = 1
+            for i in range(num_of_layers):
+                if key_template.replace("#", str(i)) in self.scale_dict.keys():
+                    no_skip_layer_list.append(key_template.replace("#", str(i)))
+            if len(no_skip_layer_list) > 0:
+                n = len(self.scale_dict[no_skip_layer_list[0]])
+            print(f"scale_type:{scale_type}, cols:{n}")
+            self.scale[scale_type] = np.full([num_of_layers, n], fill_value=-1.0)
+            for i in range(num_of_layers):
+                if key_template.replace("#", str(i)) in self.scale_dict.keys():
+                    self.scale[scale_type][i, :] = self.scale_dict[
+                        key_template.replace("#", str(i))
+                    ]
+        # concat qkv and ffn1
+        self.scale["qkv_weight_scale"] = []
+        for i in range(num_of_layers):
+            self.scale["qkv_weight_scale"].append(np.concatenate(self.scale["q_weight_scale"][i, :],
+                                                                 self.scale["k_weight_scale"][i, :],
+                                                                 self.scale["v_weight_scale"][i, :]))
+            self.scale["ffn1_weight_scale"].append(np.concatenate(self.scale["ffn1_1_weight_scale"][i, :],
+                                                                 self.scale["ffn1_2_weight_scale"][i, :]))
+
 
 @register_base_model
 class LlamaModelDybatch(LlamaPretrainedModel):
@@ -1357,7 +1420,7 @@ class LlamaModelDybatch(LlamaPretrainedModel):
             self.transformer_block.qkv_weights[idx].set_value(paddle.to_tensor(concated_qkv_weight))
 
             self.transformer_block.linear_weights[idx].set_value(
-                paddle.to_tensor(state_dict["llama.layers.{}.self_attn.o_proj.weight".format(idx)])
+                paddle.to_tensor(state_dict["llama.layers.{}.self_attn.o_proj.weight".format(idx)]).transpose((1, 0))
             )
 
             unfused_state_dict["mlp.gate_proj.weight"] = state_dict["llama.layers.{}.mlp.gate_proj.weight".format(idx)]
@@ -1365,11 +1428,11 @@ class LlamaModelDybatch(LlamaPretrainedModel):
 
             concated_ffn1_weight = np.concatenate(
                 [unfused_state_dict["mlp.gate_proj.weight"], unfused_state_dict["mlp.up_proj.weight"]], axis=-1
-            )
+            ).transpose((1, 0))
             self.transformer_block.ffn1_weights[idx].set_value(paddle.to_tensor(concated_ffn1_weight))
 
             self.transformer_block.ffn2_weights[idx].set_value(
-                paddle.to_tensor(state_dict["llama.layers.{}.mlp.down_proj.weight".format(idx)])
+                paddle.to_tensor(state_dict["llama.layers.{}.mlp.down_proj.weight".format(idx)]).transpose((1, 0))
             )
 
             self.transformer_block.ln_scales[idx].set_value(
@@ -1380,6 +1443,155 @@ class LlamaModelDybatch(LlamaPretrainedModel):
                 paddle.to_tensor(state_dict["llama.layers.{}.post_attention_layernorm.weight".format(idx)])
             )
 
+            self.transformer_block.linear_shifts[idx].set_value(
+                paddle.to_tensor(state_dict["llama.layers.{}.self_attn.o_proj.shift_bias".format(idx)])
+            )
+
+            self.transformer_block.linear_smooths[idx].set_value(
+                paddle.to_tensor(state_dict["llama.layers.{}.self_attn.o_proj.smooth_weight".format(idx)])
+            )
+
+            self.transformer_block.ffn2_shifts[idx].set_value(
+                paddle.to_tensor(state_dict["llama.layers.{}.mlp.down_proj.shift_bias".format(idx)])
+            )
+
+            self.transformer_block.ffn2_smooths[idx].set_value(
+                paddle.to_tensor(state_dict["llama.layers.{}.mlp.down_proj.smooth_weight".format(idx)])
+            )
+
+        with open('ptq_scales_map.json') as json_file:
+            scale_map_dict = json.load(json_file)
+        act_scale_map_dict = scale_map_dict["act_scale"]
+        weight_scale_map_dict = scale_map_dict["weight_scale"]
+        #TODO(wufeisheng): support multi-cards
+        model_path = "/root/paddlejob/workspace/env_run/wufeisheng/xi/quant_llama_int8"
+
+        act_scale_json_path = os.path.join(model_path, f"act_scales.json")
+        weight_scale_json_path = os.path.join(model_path, f"weight_scales.json")
+        act_scales = load_act_scale_json(
+            act_scale_json_path, act_scale_map_dict, num_of_layers=self.config.num_hidden_layers
+        )
+        self.transformer_block.act_scales = act_scales.scale
+
+        weight_scales = load_weight_scale_json(
+            weight_scale_json_path, weight_scale_map_dict, num_of_layers=self.config.num_hidden_layers
+        )
+        for k,v in weight_scales.scale.items():
+            if 'qkv_' in k:
+                for i_layer, weight_scale in enumerate(v):
+                    tmp = paddle.to_tensor(weight_scale/(127.0*127.0*act_scales.scale['qkv_in_scale'][i_layer])).reshape([self.num_attention_heads // self.config.tensor_parallel_degree,
+                                3,
+                                head_size,
+                            ]
+                        ).transpose(
+                            [1, 0, 2]
+                        ).reshape([-1])
+                    self.transformer_block.qkv_weight_out_scales[i_layer].set_value(tmp)
+                pass
+            elif 'out_linear_' in k:
+                for i_layer, weight_scale in enumerate(v):
+                    self.transformer_block.linear_weight_out_scales[i_layer].set_value(paddle.to_tensor(weight_scale/(127.0*127.0*act_scales.scale['out_linear_in_scale'][i_layer])))
+            elif 'ffn1' in k:
+                for i_layer, weight_scale in enumerate(v):
+                    self.transformer_block.ffn1_weight_out_scales[i_layer].set_value(paddle.to_tensor(weight_scale/(127.0*127.0*act_scales.scale['ffn1_in_scale'][i_layer])))
+            elif 'ffn2' in k:
+                for i_layer, weight_scale in enumerate(v):
+                    self.transformer_block.ffn2_weight_out_scales[i_layer].set_value(paddle.to_tensor(weight_scale/(127.0*127.0*act_scales.scale['ffn2_in_scale'][i_layer])))
+    
+            
+
+
+class LlamaModelDybatchInt8(LlamaModelDybatch):
+    def __init__(self, config: LlamaConfig):
+        super().__init__(config)
+        self.vocab_size = config.vocab_size
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.intermediate_size = config.intermediate_size
+        self.num_layers = config.num_hidden_layers
+        self.epsilon = config.rms_norm_eps
+        self.max_position_embeddings = config.max_position_embeddings
+
+        if config.tensor_parallel_degree > 1:
+            self.embed_tokens = fleet.meta_parallel.VocabParallelEmbedding(
+                self.vocab_size,
+                self.hidden_size,
+                weight_attr=paddle.ParamAttr(initializer=nn.initializer.XavierNormal()),
+            )
+        else:
+            self.embed_tokens = nn.Embedding(
+                self.vocab_size,
+                self.hidden_size,
+            )
+
+        # get ring_id
+        ring_id = -1
+        try:
+            hcg = fleet.get_hybrid_communicate_group()
+            model_parallel_group = hcg.get_model_parallel_group()
+            ring_id = model_parallel_group.id
+        except:
+            pass
+
+        ln_scale_attrs = [paddle.ParamAttr(name="fusellama.{}.ln_scale".format(i)) for i in range(self.num_layers)]
+        qkv_weight_attrs = [paddle.ParamAttr(name="fusellama.{}.qkv_weight".format(i)) for i in range(self.num_layers)]
+        out_proj_weight_attrs = [
+            paddle.ParamAttr(name="fusellama.{}.out_proj_weight".format(i)) for i in range(self.num_layers)
+        ]
+        ffn_ln_scale_attrs = [
+            paddle.ParamAttr(name="fusellama.{}.ffn_ln_scale".format(i)) for i in range(self.num_layers)
+        ]
+        ffn1_weight_attrs = [
+            paddle.ParamAttr(name="fusellama.{}.ffn1_weight".format(i)) for i in range(self.num_layers)
+        ]
+        ffn2_weight_attrs = [
+            paddle.ParamAttr(name="fusellama.{}.ffn2_weight".format(i)) for i in range(self.num_layers)
+        ]
+
+        qkv_weight_out_scale_attrs = [paddle.ParamAttr(name="fusellama.{}.qkv_weight_out_scale".format(i)) for i in range(self.num_layers)]
+        linear_weight_out_scale_attrs = [paddle.ParamAttr(name="fusellama.{}.linear_weight_out_scale".format(i)) for i in range(self.num_layers)]
+        ffn1_weight_out_scale_attrs = [paddle.ParamAttr(name="fusellama.{}.ffn1_weight_out_scale".format(i)) for i in range(self.num_layers)]
+        ffn2_weight_out_scale_attrs = [paddle.ParamAttr(name="fusellama.{}.ffn2_weight_out_scale".format(i)) for i in range(self.num_layers)]
+
+        linear_shift_attrs = [paddle.ParamAttr(name="fusellama.{}.linear_shift".format(i)) for i in range(self.num_layers)]
+        linear_smooth_attrs = [paddle.ParamAttr(name="fusellama.{}.linear_smooth".format(i)) for i in range(self.num_layers)]
+        ffn2_shift_attrs = [paddle.ParamAttr(name="fusellama.{}.ffn2_shift".format(i)) for i in range(self.num_layers)]
+        ffn2_smooth_attrs = [paddle.ParamAttr(name="fusellama.{}.ffn2_smooth".format(i)) for i in range(self.num_layers)]
+
+
+        self.transformer_block = FusedMultiTransformerInt8(
+            self.hidden_size,
+            self.num_attention_heads,
+            self.intermediate_size,
+            activation="swiglu",
+            num_layers=config.num_hidden_layers,
+            nranks=config.tensor_parallel_degree,
+            ring_id=ring_id,
+            ln_scale_attrs=ln_scale_attrs,
+            qkv_weight_attrs=qkv_weight_attrs,
+            linear_weight_attrs=out_proj_weight_attrs,
+            ffn_ln_scale_attrs=ffn_ln_scale_attrs,
+            ffn1_weight_attrs=ffn1_weight_attrs,
+            ffn2_weight_attrs=ffn2_weight_attrs,
+            qkv_weight_out_scale_attrs=qkv_weight_out_scale_attrs,
+            linear_weight_out_scale_attrs=linear_weight_out_scale_attrs,
+            ffn1_weight_out_scale_attrs=ffn1_weight_out_scale_attrs,
+            ffn2_weight_out_scale_attrs=ffn2_weight_out_scale_attrs,
+            linear_shift_attrs=linear_shift_attrs,
+            linear_smooth_attrs=linear_smooth_attrs,
+            ffn2_shift_attrs=ffn2_shift_attrs,
+            ffn2_smooth_attrs=ffn2_smooth_attrs
+            epsilon=self.epsilon,
+            norm_type="rmsnorm",
+            use_neox_rotary_style=True,
+        )
+        self.norm = FusedLlamaRMSNorm(config)
+
+        self.cache_kvs = None
+        self.head_dim_shape_tensor = paddle.ones((self.hidden_size // self.num_attention_heads), dtype="int8")
+
+        self.gradient_checkpointing = False
+    
 
 class LlamaPretrainingCriterion(paddle.nn.Layer):
     """
@@ -1589,9 +1801,12 @@ class LlamaForCausalLMDyBatch(GenerationDyBatch, LlamaForCausalLM):
 
     _keys_to_ignore_on_load_missing = [r"lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, is_static_int8):
         super().__init__(config)
-        self.model = LlamaModelDybatch(config)
+        if is_static_int8:
+            self.model = LlamaModelDybatchInt8(config)
+        else:
+            self.model = LlamaModelDybatch(config)
         self.lm_head = LlamaLMHead(config)
 
     def prepare_inputs_for_generation(
