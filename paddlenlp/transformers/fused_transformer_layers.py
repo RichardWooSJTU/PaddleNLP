@@ -377,7 +377,6 @@ class FusedMultiTransformer(Layer):
         seq_lens=None,
         time_step=None,
     ):
-        # print("Time step is: ", time_step)
         r"""
         Applies multi transformer layers on the input.
 
