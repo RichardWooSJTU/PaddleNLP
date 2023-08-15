@@ -166,6 +166,7 @@ class FusedMultiTransformer(Layer):
         else:
             self.norm_func = fused_rms_norm
         self.use_neox_rotary_style = use_neox_rotary_style
+        self._norm_weight_dtype = "float32" if self._norm_type == "layernorm" else self._dtype
 
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -199,6 +200,8 @@ class FusedMultiTransformer(Layer):
             return attrs
 
         def _add_parameter(param):
+            if param is None: 
+                return 
             assert param.name not in self._parameters
             self._parameters[param.name] = param
 
@@ -221,13 +224,17 @@ class FusedMultiTransformer(Layer):
                 attr=ln_scale_attr,
                 shape=[embed_dim],
                 default_initializer=Constant(value=1.0),
-                # dtype='float32',
+                dtype=self._norm_weight_dtype, 
             )
-            ln_bias = self.create_parameter(
-                attr=ln_bias_attr,
-                shape=[embed_dim],
-                is_bias=True,
-            )
+            ln_bias = None 
+            if ln_bias_attr: 
+                ln_bias = self.create_parameter(
+                    attr=ln_bias_attr, 
+                    shape=[embed_dim], 
+                    is_bias=True,
+                    dtype=self._norm_weight_dtype, 
+                )
+            
             qkv_weight = self.create_parameter(
                 shape=[3 * num_heads * self.head_dim, embed_dim]
                 if trans_qkvw
@@ -236,62 +243,79 @@ class FusedMultiTransformer(Layer):
                 dtype=self._dtype,
                 is_bias=False,
             )
-            qkv_bias = self.create_parameter(
-                shape=[3 * num_heads * self.head_dim],
-                attr=qkv_bias_attr,
-                dtype=self._dtype,
-                is_bias=True,
-            )
+
+            qkv_bias = None
+            if qkv_bias_attr: 
+                qkv_bias = self.create_parameter(
+                    shape=[3 * num_heads * self.head_dim],
+                    attr=qkv_bias_attr,
+                    dtype=self._dtype,
+                    is_bias=True,
+                )
+            
             linear_weight = self.create_parameter(
                 shape=[num_heads * self.head_dim, embed_dim],
                 attr=linear_weight_attr,
                 dtype=self._dtype,
                 is_bias=False,
             )
-            linear_bias = self.create_parameter(
-                shape=[embed_dim],
-                attr=linear_bias_attr,
-                dtype=self._dtype,
-                is_bias=True,
-            )
 
+            linear_bias = None 
+            if linear_bias_attr: 
+                linear_bias = self.create_parameter(
+                    shape=[embed_dim],
+                    attr=linear_bias_attr,
+                    dtype=self._dtype,
+                    is_bias=True,
+                )
+            
             ffn_ln_scale = self.create_parameter(
                 shape=[embed_dim],
                 attr=ffn_ln_scale_attr,
                 is_bias=False,
                 default_initializer=Constant(1.0),
-                # dtype='float32',
+                dtype=self._norm_weight_dtype, 
             )
-            ffn_ln_bias = self.create_parameter(
-                shape=[embed_dim],
-                attr=ffn_ln_bias_attr,
-                is_bias=True,
-            )
+
+            ffn_ln_bias = None 
+            if ffn_ln_bias_attr: 
+                ffn_ln_bias = self.create_parameter(
+                    shape=[embed_dim], attr=ffn_ln_bias_attr, is_bias=True,
+                    dtype=self._norm_weight_dtype, 
+                )
+            
             ffn1_weight = self.create_parameter(
-                shape=[embed_dim, dim_feedforward * 2],
+                shape=[embed_dim, dim_feedforward * 2] if activation.endswith("glu") else [embed_dim, dim_feedforward],
                 attr=ffn1_weight_attr,
                 dtype=self._dtype,
                 is_bias=False,
             )
-            ffn1_bias = self.create_parameter(
-                shape=[dim_feedforward * 2],
-                attr=ffn1_bias_attr,
-                dtype=self._dtype,
-                is_bias=True,
-            )
+
+            ffn1_bias = None 
+            if ffn1_bias_attr: 
+                ffn1_bias = self.create_parameter(
+                    shape=[dim_feedforward * 2] if activation.endswith("glu") else [dim_feedforward],
+                    attr=ffn1_bias_attr,
+                    dtype=self._dtype,
+                    is_bias=True,
+                )  
+            
             ffn2_weight = self.create_parameter(
                 shape=[dim_feedforward, embed_dim],
                 attr=ffn2_weight_attr,
                 dtype=self._dtype,
                 is_bias=False,
             )
-            ffn2_bias = self.create_parameter(
-                shape=[embed_dim],
-                attr=ffn2_bias_attr,
-                dtype=self._dtype,
-                is_bias=True,
-            )
 
+            ffn2_bias = None 
+            if ffn2_bias_attr: 
+                ffn2_bias = self.create_parameter(
+                    shape=[embed_dim],
+                    attr=ffn2_bias_attr,
+                    dtype=self._dtype,
+                    is_bias=True,
+                )
+            
             # tensor model parallel
             if nranks > 1:
                 # column parallel
@@ -477,7 +501,7 @@ class FusedMultiTransformer(Layer):
                     residual=bias_residual_input
                 )
             else:
-                tmp_out, bias_residual_input = self.norm_func(
+                tmp_out, bias_residual_input = fused_layer_norm(
                     ffn2_out,
                     None,
                     None,
