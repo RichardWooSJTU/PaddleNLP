@@ -65,6 +65,8 @@ class PredictorArgument:
     inference_model: bool = field(default=False, metadata={"help": "whether use InferenceModel to do generation"})
     batch_size: int = field(default=1, metadata={"help": "The batch size of data."})
     max_batch_size: int = field(default=None, metadata={"help": "The max batch size of data during serving."})
+    quant_model_path: str = field(default="", metadata={"help": "Quant model checkpoints path"})
+    quant_type: str = field(default="", metadata={"help": "Quant type of the model sprcified in quant_model_path, 'A8W8' is supported"})
 
 
 @dataclass
@@ -388,6 +390,7 @@ class DygraphInferencePredictor(BasePredictor):
 
         self.dtype = dtype
 
+
         self.cache_kvs = [
             paddle.zeros(shape, dtype=dtype)
             for shape in self.model.get_cache_kvs_shape(self.model.config, config.max_batch_size)
@@ -508,6 +511,9 @@ def create_predictor(
 
             config.tensor_parallel_degree = tensor_parallel_degree
             config.tensor_parallel_rank = tensor_parallel_rank
+            config.quant_type = predictor_args.quant_type
+            config.quant_model_path = predictor_args.quant_model_path
+
             model = LlamaForCausalLMInferenceModel.from_pretrained(predictor_args.model_name_or_path, config=config)
             predictor = DygraphInferencePredictor(predictor_args, model=model, tokenizer=tokenizer)
         elif predictor_args.mode == "static":

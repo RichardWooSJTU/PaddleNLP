@@ -76,7 +76,7 @@ class GenerationInferenceModel(GenerationMixin):
             ],  # cache_kvs
         ]
         model = paddle.jit.to_static(self.generate, input_spec=input_spec)
-        paddle.jit.save(model, output_path)
+        paddle.jit.save(model, output_path, skip_prune_program=True)
 
     @paddle.no_grad()
     def generate(
@@ -235,7 +235,7 @@ class GenerationInferenceModel(GenerationMixin):
             # compute next_tokens, use paddle.top_p_sampling
             logits = logits / temperature
 
-            _, next_tokens = top_p_sampling(probs, top_p)
+            _, next_tokens = top_p_sampling(probs, top_p, 0)
 
             if self.model.config.tensor_parallel_degree > 1:
                 paddle.distributed.broadcast(next_tokens, 0)

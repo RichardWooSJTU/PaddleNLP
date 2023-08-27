@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import os
 import paddle
+import paddleslim
 from paddle import nn
 from paddle.distributed.fleet.meta_parallel import (
     ColumnParallelLinear,
@@ -156,8 +159,38 @@ def apply_ptq(quant_args, trainer, ptq_dataloader):
         description="PTQ",
         max_eval_iters=quant_args.ptq_step,
     )
-    trainer.model = ptq.convert(trainer.model, inplace=True)
+
     logger.info("***** PTQ done *****")
+
+    act_scales = {}
+    weight_scales = {}
+    for cur_name, cur_layer in trainer.model.named_sublayers():
+        if type(cur_layer) == paddleslim.quant.observers.abs_max_weight.AbsMaxChannelWiseWeightObserverLayer:
+            if '_observer' not in cur_name:
+                weight_scales[cur_name] = cur_layer.scales().numpy().tolist()
+                print(cur_name, weight_scales[cur_name][0])
+        if type(cur_layer) ==  paddleslim.quant.observers.abs_max.AbsmaxObserverLayer:
+            if '_observer' not in cur_name:
+                act_scales[cur_name] = float(cur_layer.scales())
+                print(cur_name, act_scales[cur_name])
+        if type(cur_layer) == paddleslim.quant.observers.avg.AVGObserverLayer:
+            if '_observer' not in cur_name:
+                act_scales[cur_name] = float(cur_layer.scales())
+                print(cur_name, act_scales[cur_name])
+        
+    with open(f"./quant_model/act_scales.json", "w") as outfile:
+        json.dump(act_scales, outfile)
+        print('save act scales')
+    with open(f"./quant_model/weight_scales.json", "w") as outfile:
+        json.dump(weight_scales, outfile)
+        print('save weight scales')
+
+    trainer.model = ptq.convert(trainer.model, inplace=True)
+    logger.info("***** convert done *****")
+    model_path = os.path.join('./quant_model', "model.pdparams") 
+    paddle.save(trainer.model.state_dict(), model_path)
+    print("Save model to %s" % model_path)
+
 
 
 def apply_gptq(quant_args, trainer, ptq_dataloader):

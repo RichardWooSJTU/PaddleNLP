@@ -265,9 +265,26 @@ python predictor.py \
     --max_length 1024 \
     --mode "dynamic" \
     --inference_model
+
+# 使用A8W8量化推理
+python predictor.py \
+    --model_name_or_path "quant_model_llama" \
+    --dtype float16 \
+    --max_length 1024 \
+    --mode "dynamic" \
+    --quant_type "A8W8" \
+    --quant_model_path "quant_model_llama" \
+    --inference_model
 ```
 
 ### 4.4 InferenceModel 静态图推理
+
+```shell
+# 首先安装导出和运行时所需要的自定义算子
+cd ../csrc
+python setup_cuda.py install
+cd ../llm
+```
 
 ```shell
 # 首先需要运行一下命令将InferenceModel动态图导出为静态图

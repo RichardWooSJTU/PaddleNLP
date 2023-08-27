@@ -124,3 +124,9 @@ FETCH_HEAD
 # vscode
 .vscode
 ./ppdiffusers/ppdiffusers/version.py
+
+quant_model*
+log/
+*tar.gz
+data/
+inference/
