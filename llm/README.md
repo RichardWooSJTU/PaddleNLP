@@ -268,6 +268,14 @@ python predictor.py \
     --max_length 1024 \
     --mode "dynamic" \
     --inference_model
+
+python predictor.py \
+    --model_name_or_path meta-llama/Llama-2-7b-chat \
+    --dtype float16 \
+    --max_length 1024 \
+    --mode "dynamic" \
+    --inference_model \
+    --use_fp8 1
 ```
 
 ### 4.4 InferenceModel 静态图推理
@@ -279,6 +287,13 @@ python predictor.py \
 python export_model.py \
     --model_name_or_path meta-llama/Llama-2-7b-chat \
     --output_path ./inference \
+    --dtype float16 \
+    --inference_model
+
+python export_model.py \
+    --model_name_or_path meta-llama/Llama-2-7b-chat \
+    --output_path ./inference_wint8 \
+    --quant_type "weight_only_int8" \
     --dtype float16 \
     --inference_model
 

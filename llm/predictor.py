@@ -86,6 +86,7 @@ class PredictorArgument:
             "help": "If benchmark set as `True`, we will force model decode to max_length, which is helpful to compute throughput. "
         },
     )
+    use_fp8: int = field(default=0, metadata={"help": "whether to use fp8."})
 
 
 @dataclass
@@ -431,6 +432,8 @@ class InferencePredictorMixin:
                 top_p=self.config.top_p,
                 temperature=self.config.temperature,
                 pre_caches_length=pre_caches_length,
+                benchmark=benchmark,
+                src_length=self.config.src_length,
             )
 
             for i in range(inputs["input_ids"].shape[0]):
@@ -659,6 +662,7 @@ def create_predictor(
                     config.tensor_parallel_degree = tensor_parallel_degree
                     config.tensor_parallel_rank = tensor_parallel_rank
                     config.quant_bits = -1
+                    config.use_fp8 = predictor_args.use_fp8
 
                     if predictor_args.quant_type.startswith("weight_only_int"):
                         quant_bits = int(predictor_args.quant_type[-1])
@@ -768,8 +772,8 @@ def benchmark(predictor, predictor_args, model_args):
     batch_benchmark_texts = batchfy_text(benchmark_texts, predictor_args.batch_size)
     print("***********Start Benchmark**********")
 
-    warmup_time = 10
-    test_time = 100
+    warmup_time = 1
+    test_time = 10
 
     print("***********Start Warmup**********")
     for _ in range(warmup_time):
@@ -785,10 +789,11 @@ def benchmark(predictor, predictor_args, model_args):
 
     output_tokens = sum([len(output) for output in outputs])
     print(
-        "Input length is: {}, Output length is: {}, bs is: {}, Generate speed is: {:.3f} tokens/s(ips), QPS: {:.3f} requests/s. ".format(
+        "Input length is: {}, Output length is: {}, bs is: {}, elapse, {}, Generate speed is: {:.3f} tokens/s(ips), QPS: {:.3f} requests/s. ".format(
             predictor_args.src_length,
             predictor_args.max_length,
             predictor_args.batch_size,
+            (end - start) / test_time,
             (output_tokens / (end - start) / test_time),
             (predictor_args.batch_size / (end - start) / test_time),
         )

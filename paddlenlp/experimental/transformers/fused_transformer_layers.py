@@ -166,6 +166,7 @@ class FusedMultiTransformer(Layer):
         nranks=1,
         trans_qkvw=True,
         ring_id=-1,
+        use_fp8=False,
         name=None,
     ):
         super().__init__()
@@ -196,6 +197,8 @@ class FusedMultiTransformer(Layer):
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
 
+        self.use_fp8 = use_fp8
+
         # tensor model parallel
         if nranks > 1:
             assert ring_id != -1
@@ -216,6 +219,9 @@ class FusedMultiTransformer(Layer):
         if self.quant_bits != -1:
             self.use_weight_only = True
             self.weight_dtype = "int" + str(self.quant_bits)
+        
+        if self.use_fp8:
+            self.weight_dtype = "float8"
 
         self.ln_scales, self.ln_biases = [], []
         self.qkv_weights, self.qkv_weights_scale, self.qkv_biases = [], [], []
@@ -307,7 +313,7 @@ class FusedMultiTransformer(Layer):
 
             linear_weight_shape = [num_heads * self.head_dim, embed_dim]
             linear_weight_scale = None
-            if self.use_weight_only:
+            if self.use_weight_only or self.use_fp8:
                 linear_weight_shape = [embed_dim, num_heads * self.head_dim]
                 if self.quant_bits == 4:
                     linear_weight_shape[0] //= 2
@@ -355,7 +361,7 @@ class FusedMultiTransformer(Layer):
                 [embed_dim, dim_feedforward * 2] if activation.endswith("glu") else [embed_dim, dim_feedforward]
             )
             ffn1_weight_scale = None
-            if self.use_weight_only:
+            if self.use_weight_only or self.use_fp8:
                 ffn1_weight_shape = (
                     [dim_feedforward * 2, embed_dim] if activation.endswith("glu") else [dim_feedforward, embed_dim]
                 )
@@ -386,7 +392,7 @@ class FusedMultiTransformer(Layer):
 
             ffn2_weight_shape = [dim_feedforward, embed_dim]
             ffn2_weight_scale = None
-            if self.use_weight_only:
+            if self.use_weight_only or self.use_fp8:
                 ffn2_weight_shape = [embed_dim, dim_feedforward]
                 if self.quant_bits == 4:
                     ffn2_weight_shape[0] //= 2
@@ -544,6 +550,8 @@ class FusedMultiTransformer(Layer):
                     weight_scale=self.qkv_weights_scale[i],
                     weight_dtype=self.weight_dtype,
                 )
+            elif self.use_fp8:
+                qkv_out = paddle.matmul(ln_out.astype('float8'), self.qkv_weights[i])
             else:
                 qkv_out = self.linear(ln_out, self.qkv_weights[i], self.qkv_biases[i], transpose_weight=True)
 
@@ -607,6 +615,8 @@ class FusedMultiTransformer(Layer):
                     weight_scale=self.linear_weights_scale[i],
                     weight_dtype=self.weight_dtype,
                 )
+            elif self.use_fp8:
+                out_linear_out = paddle.matmul(fmha_out.astype('float8'), self.linear_weights[i])
             else:
                 out_linear_out = paddle.matmul(fmha_out, self.linear_weights[i])
 
@@ -645,6 +655,8 @@ class FusedMultiTransformer(Layer):
                     weight_scale=self.ffn1_weights_scale[i],
                     weight_dtype=self.weight_dtype,
                 )
+            elif self.use_fp8:
+                ffn1_out = paddle.matmul(tmp_out.astype('float8'), self.ffn1_weights[i])
             else:
                 ffn1_out = paddle.matmul(tmp_out, self.ffn1_weights[i])
             ffn1_out = fused_act_bias_wrapper(ffn1_out, self.ffn1_biases[i], act_method=self.activation)
@@ -657,6 +669,8 @@ class FusedMultiTransformer(Layer):
                     weight_scale=self.ffn2_weights_scale[i],
                     weight_dtype=self.weight_dtype,
                 )
+            elif self.use_fp8:
+                ffn2_out = paddle.matmul(ffn1_out.astype('float8'), self.ffn2_weights[i])
             else:
                 ffn2_out = paddle.matmul(ffn1_out, self.ffn2_weights[i])
 

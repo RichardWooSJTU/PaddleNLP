@@ -76,6 +76,7 @@ class LlamaInferenceModel(LlamaPretrainedModel):
         self.epsilon = config.rms_norm_eps
         self.max_position_embeddings = config.max_position_embeddings
         self.use_weight_only = False
+        self.use_fp8 = config.use_fp8
 
         self.quant_bits = config.quant_bits
         self.quant_algo = "weight_only_int" + str(self.quant_bits)
@@ -180,6 +181,7 @@ class LlamaInferenceModel(LlamaPretrainedModel):
             epsilon=self.epsilon,
             norm_type="rmsnorm",
             use_neox_rotary_style=True,
+            use_fp8=self.use_fp8,
         )
         self.norm = FusedLlamaRMSNorm(config)
 
@@ -361,6 +363,10 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                 )
                 self.transformer_block.qkv_weights[idx].set_value(qkv_quanted_weight_tensor)
                 self.transformer_block.qkv_weights_scale[idx].set_value(qkv_weight_scale_tensor)
+            elif self.use_fp8:
+                qkv_weight_tensor = paddle.to_tensor(concated_qkv_weight)
+                qkv_weight_tensor = qkv_weight_tensor.astype('float8')
+                self.transformer_block.qkv_weights[idx].set_value(qkv_weight_tensor)
             else:
                 self.transformer_block.qkv_weights[idx].set_value(qkv_weight_tensor)
 
@@ -371,6 +377,9 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                 )
                 self.transformer_block.linear_weights[idx].set_value(linear_quanted_weight_tensor)
                 self.transformer_block.linear_weights_scale[idx].set_value(linear_weight_scale_tensor)
+            elif self.use_fp8:
+                linear_weight_tensor = paddle.transpose(linear_weight_tensor, perm=[1, 0]).astype('float8')
+                self.transformer_block.linear_weights[idx].set_value(linear_weight_tensor)
             else:
                 self.transformer_block.linear_weights[idx].set_value(linear_weight_tensor)
 
@@ -388,6 +397,9 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                 )
                 self.transformer_block.ffn1_weights[idx].set_value(ffn1_quanted_weight_tensor)
                 self.transformer_block.ffn1_weights_scale[idx].set_value(ffn1_weight_scale_tensor)
+            elif self.use_fp8:
+                ffn1_weight_tensor = paddle.transpose(ffn1_weight_tensor, perm=[1, 0]).astype('float8')
+                self.transformer_block.ffn1_weights[idx].set_value(ffn1_weight_tensor)
             else:
                 self.transformer_block.ffn1_weights[idx].set_value(ffn1_weight_tensor)
 
@@ -398,6 +410,9 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                 )
                 self.transformer_block.ffn2_weights[idx].set_value(ffn2_quanted_weight_tensor)
                 self.transformer_block.ffn2_weights_scale[idx].set_value(ffn2_weight_scale_tensor)
+            elif self.use_fp8:
+                ffn2_weight_tensor = paddle.transpose(ffn2_weight_tensor, perm=[1, 0]).astype('float8')
+                self.transformer_block.ffn1_weights[idx].set_value(ffn2_weight_tensor)
             else:
                 self.transformer_block.ffn2_weights[idx].set_value(ffn2_weight_tensor)
 
