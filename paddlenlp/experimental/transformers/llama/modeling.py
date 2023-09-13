@@ -366,7 +366,7 @@ class LlamaInferenceModel(LlamaPretrainedModel):
             elif self.use_fp8:
                 qkv_weight_tensor = paddle.to_tensor(concated_qkv_weight)
                 qkv_weight_tensor = qkv_weight_tensor.astype('float8')
-                self.transformer_block.qkv_weights[idx].set_value(qkv_weight_tensor)
+                self.transformer_block.qkv_weights[idx].get_tensor()._copy_from(qkv_weight_tensor, paddle.base.core.CUDAPlace())
             else:
                 self.transformer_block.qkv_weights[idx].set_value(qkv_weight_tensor)
 
@@ -379,7 +379,7 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                 self.transformer_block.linear_weights_scale[idx].set_value(linear_weight_scale_tensor)
             elif self.use_fp8:
                 linear_weight_tensor = paddle.transpose(linear_weight_tensor, perm=[1, 0]).astype('float8')
-                self.transformer_block.linear_weights[idx].set_value(linear_weight_tensor)
+                self.transformer_block.linear_weights[idx].get_tensor()._copy_from(linear_weight_tensor, paddle.base.core.CUDAPlace())
             else:
                 self.transformer_block.linear_weights[idx].set_value(linear_weight_tensor)
 
@@ -399,7 +399,7 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                 self.transformer_block.ffn1_weights_scale[idx].set_value(ffn1_weight_scale_tensor)
             elif self.use_fp8:
                 ffn1_weight_tensor = paddle.transpose(ffn1_weight_tensor, perm=[1, 0]).astype('float8')
-                self.transformer_block.ffn1_weights[idx].set_value(ffn1_weight_tensor)
+                self.transformer_block.ffn1_weights[idx].get_tensor()._copy_from(ffn1_weight_tensor, paddle.base.core.CUDAPlace())
             else:
                 self.transformer_block.ffn1_weights[idx].set_value(ffn1_weight_tensor)
 
@@ -412,7 +412,7 @@ class LlamaInferenceModel(LlamaPretrainedModel):
                 self.transformer_block.ffn2_weights_scale[idx].set_value(ffn2_weight_scale_tensor)
             elif self.use_fp8:
                 ffn2_weight_tensor = paddle.transpose(ffn2_weight_tensor, perm=[1, 0]).astype('float8')
-                self.transformer_block.ffn1_weights[idx].set_value(ffn2_weight_tensor)
+                self.transformer_block.ffn1_weights[idx].get_tensor()._copy_from(ffn2_weight_tensor, paddle.base.core.CUDAPlace())
             else:
                 self.transformer_block.ffn2_weights[idx].set_value(ffn2_weight_tensor)
 
