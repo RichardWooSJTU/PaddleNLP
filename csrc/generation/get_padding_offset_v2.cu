@@ -20,20 +20,25 @@ __global__ void GetPaddingOffsetKernelV2(int *padding_offset,
                                          int *cu_seqlens_q,
                                          int *cu_seqlens_k,
                                          const int *cum_offsets,
-                                         const int *seq_lens,
+                                         const int *seq_lens_this_time,
+                                         const int *seq_lens_decoder,
                                          const int max_seq_len) {
   // get padding offset of each batch
   const int bi = blockIdx.x;
   const int ti = threadIdx.x;
   int cum_offset = bi == 0 ? 0 : cum_offsets[bi - 1];
-  for (int i = ti; i < seq_lens[bi]; i += blockDim.x) {
+  for (int i = ti; i < seq_lens_this_time[bi]; i += blockDim.x) {
     padding_offset[bi * max_seq_len - cum_offset + i] = cum_offset;
   }
   if (ti == 0) {
     cum_offsets_out[bi] = cum_offset;
     int cum_seq_len = (bi + 1) * max_seq_len - cum_offsets[bi];
     cu_seqlens_q[bi + 1] = cum_seq_len;
-    cu_seqlens_k[bi + 1] = cum_seq_len;
+    int cum_seq_len_k = cum_seq_len;
+    for (int j = 0; j <= bi; ++j) {
+      cum_seq_len_k += (seq_lens_decoder[j]);
+    }
+    cu_seqlens_k[bi + 1] = cum_seq_len_k;
   }
 }
 
@@ -41,10 +46,11 @@ __global__ void GetPaddingOffsetKernelV2(int *padding_offset,
 std::vector<paddle::Tensor> GetPaddingOffsetV2(const paddle::Tensor& input_ids,
                                                const paddle::Tensor& cum_offsets,
                                                const paddle::Tensor& token_num,
-                                               const paddle::Tensor& seq_len) {
+                                               const paddle::Tensor& seq_lens_this_time,
+                                               const paddle::Tensor& seq_lens_decoder) {
     auto cu_stream = input_ids.stream();
     std::vector<int64_t> input_ids_shape = input_ids.shape();
-    const int bsz = seq_len.shape()[0];
+    const int bsz = seq_lens_this_time.shape()[0];
     const int seq_length = input_ids_shape[1];
     auto cum_offsets_out = cum_offsets.copy_to(cum_offsets.place(), false);
     auto cpu_token_num = token_num.copy_to(paddle::CPUPlace(), false);
@@ -61,12 +67,13 @@ std::vector<paddle::Tensor> GetPaddingOffsetV2(const paddle::Tensor& input_ids,
       cu_seqlens_q.data<int>(),
       cu_seqlens_k.data<int>(),
       cum_offsets.data<int>(),
-      seq_len.data<int>(),
+      seq_lens_this_time.data<int>(),
+      seq_lens_decoder.data<int>(),
       seq_length);
     RemovePaddingV2<<<bsz, blockSize, 0, cu_stream>>>(
       x_remove_padding.data<int64_t>(), 
       input_ids.data<int64_t>(), 
-      seq_len.data<int>(),
+      seq_lens_this_time.data<int>(),
       cum_offsets_out.data<int>(), 
       seq_length);
     return {x_remove_padding, cum_offsets_out, padding_offset, cu_seqlens_q, cu_seqlens_k}; // , enc_token_num, dec_token_num};
@@ -75,8 +82,9 @@ std::vector<paddle::Tensor> GetPaddingOffsetV2(const paddle::Tensor& input_ids,
 std::vector<std::vector<int64_t>> GetPaddingOffsetV2InferShape(const std::vector<int64_t>& input_ids_shape,
                                                              const std::vector<int64_t>& cum_offsets_shape,
                                                              const std::vector<int64_t>& token_num_shape,
-                                                             const std::vector<int64_t>& seq_len_shape) {
-    int64_t bsz = seq_len_shape[0];
+                                                             const std::vector<int64_t>& seq_lens_this_time_shape,
+                                                             const std::vector<int64_t>& seq_lens_decoder_shape) {
+    int64_t bsz = seq_lens_this_time_shape[0];
     int64_t seq_len = input_ids_shape[1];
     return {{-1}, {bsz}, {-1}, {bsz + 1}, {bsz + 1}};
 }
@@ -84,12 +92,13 @@ std::vector<std::vector<int64_t>> GetPaddingOffsetV2InferShape(const std::vector
 std::vector<paddle::DataType> GetPaddingOffsetV2InferDtype(const paddle::DataType& input_ids_dtype,
                                                          const paddle::DataType& cum_offsets_dtype,
                                                          const paddle::DataType& token_num_dtype,
-                                                         const paddle::DataType& seq_len_dtype) {
-    return {input_ids_dtype, seq_len_dtype, seq_len_dtype, seq_len_dtype, seq_len_dtype};
+                                                         const paddle::DataType& seq_lens_this_time_dtype,
+                                                         const paddle::DataType& seq_lens_decoder_dtype) {
+    return {input_ids_dtype, seq_lens_this_time_dtype, seq_lens_this_time_dtype, seq_lens_this_time_dtype, seq_lens_this_time_dtype};
 }
 
 PD_BUILD_OP(get_padding_offset_v2)
-    .Inputs({"input_ids", "token_num", "cum_offsets", "seq_len"})
+    .Inputs({"input_ids", "token_num", "cum_offsets", "seq_lens_this_time", "seq_lens_decoder"})
     .Outputs({"x_remove_padding", "cum_offsets_out", "padding_offset", "cu_seqlens_q", "cu_seqlens_k"})
     .SetKernelFn(PD_KERNEL(GetPaddingOffsetV2))
     .SetInferShapeFn(PD_INFER_SHAPE(GetPaddingOffsetV2InferShape))

@@ -38,6 +38,8 @@ if is_paddlenlp_ops_available():
         transpose_remove_padding,
         write_cache_kv,
         write_int8_cache_kv,
+        encode_rotary_qk_variable,
+        medusa_qkv_transpose_split_fetch_concat,
     )
 else:
     logger.warning(
@@ -1312,3 +1314,627 @@ class FusedBlockMultiTransformer(Layer):
 
         out = rebuild_padding_v2(tmp_out, cum_offsets, seq_lens_decoder, seq_lens_encoder, max_input_length)
         return out, caches
+
+
+def flash_attn_unpadded_with_mask(
+    query,
+    key,
+    value,
+    attn_mask,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    scale,
+    dropout=0.0,
+    causal=False,
+    return_softmax=False,
+    fixed_seed_offset=None,
+    rng_name="",
+    training=True,
+    name=None,
+):
+    r"""
+    
+    """
+    if in_dynamic_mode():
+        (
+            result_attention,
+            result_softmax,
+        ) = paddle._C_ops.flash_attn_unpadded(
+            query,
+            key,
+            value,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            fixed_seed_offset,
+            attn_mask,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale,
+            dropout,
+            causal,
+            return_softmax,
+            not training,
+            rng_name,
+        )
+        return result_attention, result_softmax if return_softmax else None
+
+    helper = LayerHelper('flash_attn_unpadded', **locals())
+    dtype = helper.input_dtype(input_param_name='q')
+    out = helper.create_variable_for_type_inference(dtype)
+    softmax = helper.create_variable_for_type_inference(dtype)
+    softmax_lse = helper.create_variable_for_type_inference(paddle.float32)
+    seed_offset = helper.create_variable_for_type_inference(paddle.int64)
+    inputs = {
+        'q': query,
+        'k': key,
+        'v': value,
+        'attn_mask': attn_mask,
+        'cu_seqlens_q': cu_seqlens_q,
+        'cu_seqlens_k': cu_seqlens_k,
+        'fixed_seed_offset': fixed_seed_offset,
+    }
+    outputs = {
+        'out': out,
+        'softmax': softmax,
+        'softmax_lse': softmax_lse,
+        'seed_offset': seed_offset,
+    }
+    helper.append_op(
+        type='flash_attn_unpadded',
+        inputs=inputs,
+        outputs=outputs,
+        attrs={
+            'max_seqlen_q': max_seqlen_q,
+            'max_seqlen_k': max_seqlen_k,
+            'scale': scale,
+            'dropout': dropout,
+            'causal': causal,
+            'return_softmax': return_softmax,
+            'is_test': not training,
+            'rng_name': rng_name,
+        },
+    )
+    return out, softmax if return_softmax else None
+
+import math
+class FusedMedusaMultiTransformer(Layer):
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        dim_feedforward,
+        quant_bits=-1,  # -1 means use Half precision.
+        dropout_rate=0.0,
+        activation="gelu",
+        norm_type="layernorm",
+        use_neox_rotary_style=False,
+        normalize_before=True,
+        ln_scale_attrs=None,
+        ln_bias_attrs=None,
+        qkv_weight_attrs=None,
+        qkv_weight_scale_attrs=None,
+        qkv_bias_attrs=None,
+        linear_weight_attrs=None,
+        linear_weight_scale_attrs=None,
+        linear_bias_attrs=None,
+        ffn_ln_scale_attrs=None,
+        ffn_ln_bias_attrs=None,
+        ffn1_weight_attrs=None,
+        ffn1_weight_scale_attrs=None,
+        ffn1_bias_attrs=None,
+        ffn2_weight_attrs=None,
+        ffn2_weight_scale_attrs=None,
+        ffn2_bias_attrs=None,
+        epsilon=1e-5,
+        residual_alpha=1.0,
+        num_layers=-1,
+        nranks=1,
+        trans_qkvw=True,
+        ring_id=-1,
+        name=None,
+    ):
+        super().__init__()
+
+        assert embed_dim > 0, "Expected embed_dim to be greater than 0, " "but received {}".format(embed_dim)
+        assert num_heads > 0, "Expected nhead to be greater than 0, " "but received {}".format(num_heads)
+        assert dim_feedforward > 0, "Expected dim_feedforward to be greater than 0, but received {}".format(
+            dim_feedforward
+        )
+
+        self.normalize_before = normalize_before
+        self._dtype = self._helper.get_default_dtype()
+        self._epsilon = epsilon
+        self._residual_alpha = residual_alpha
+        self._trans_qkvw = trans_qkvw
+        self._ring_id = ring_id
+        self.nranks = nranks
+        self.norm_type = norm_type
+        if norm_type == "layernorm":
+            self.norm_func = fused_layer_norm
+        else:
+            self.norm_func = fused_rms_norm
+        self.use_neox_rotary_style = use_neox_rotary_style
+        self._norm_weight_dtype = "float32" if self.norm_type == "layernorm" else self._dtype
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+
+        # tensor model parallel
+        if nranks > 1:
+            assert ring_id != -1
+        assert num_heads % nranks == 0
+        assert dim_feedforward % nranks == 0
+        num_heads = num_heads // nranks
+        dim_feedforward = dim_feedforward // nranks
+        self._dim_feedforward = dim_feedforward
+
+        if isinstance(qkv_weight_attrs, (list, tuple)):
+            num_layers = len(qkv_weight_attrs)
+        assert num_layers > 0
+
+        self.quant_bits = quant_bits
+        self.use_weight_only = False
+        self.weight_dtype = self._dtype
+        self.create_params_type = self._dtype
+
+        if self.quant_bits != -1:
+            self.use_weight_only = True
+            self.create_params_type = (
+                "int8"  # If use weightonly int4, params dtype is int8, and one of the dimension will be half.
+            )
+            self.weight_dtype = "int" + str(self.quant_bits)
+
+        self.ln_scales, self.ln_biases = [], []
+        self.qkv_weights, self.qkv_weights_scale, self.qkv_biases = [], [], []
+        self.linear_weights, self.linear_weights_scale, self.linear_biases = [], [], []
+        self.ffn_ln_scales, self.ffn_ln_biases = [], []
+        self.ffn1_weights, self.ffn1_weights_scale, self.ffn1_biases = [], [], []
+        self.ffn2_weights, self.ffn2_weights_scale, self.ffn2_biases = [], [], []
+
+        def get_attr(attrs, idx):
+            if isinstance(attrs, (list, tuple)):
+                assert len(attrs) == num_layers
+                return attrs[idx]
+            return attrs
+
+        def _add_parameter(param):
+            if param is None:
+                return
+            assert param.name not in self._parameters
+            self._parameters[param.name] = param
+
+        for i in range(num_layers):
+            ln_scale_attr = get_attr(ln_scale_attrs, i)
+            ln_bias_attr = get_attr(ln_bias_attrs, i)
+            qkv_weight_attr = get_attr(qkv_weight_attrs, i)
+            qkv_weight_scale_attr = get_attr(qkv_weight_scale_attrs, i)
+
+            qkv_bias_attr = get_attr(qkv_bias_attrs, i)
+            linear_weight_attr = get_attr(linear_weight_attrs, i)
+            linear_weight_scale_attr = get_attr(linear_weight_scale_attrs, i)
+            linear_bias_attr = get_attr(linear_bias_attrs, i)
+
+            ffn_ln_scale_attr = get_attr(ffn_ln_scale_attrs, i)
+            ffn_ln_bias_attr = get_attr(ffn_ln_bias_attrs, i)
+            ffn1_weight_attr = get_attr(ffn1_weight_attrs, i)
+            ffn1_weight_scale_attr = get_attr(ffn1_weight_scale_attrs, i)
+            ffn1_bias_attr = get_attr(ffn1_bias_attrs, i)
+            ffn2_weight_attr = get_attr(ffn2_weight_attrs, i)
+            ffn2_weight_scale_attr = get_attr(ffn2_weight_scale_attrs, i)
+            ffn2_bias_attr = get_attr(ffn2_bias_attrs, i)
+
+            ln_scale = self.create_parameter(
+                attr=ln_scale_attr,
+                shape=[embed_dim],
+                default_initializer=Constant(value=1.0),
+                dtype=self._norm_weight_dtype,
+            )
+            ln_bias = None
+            if ln_bias_attr:
+                ln_bias = self.create_parameter(
+                    attr=ln_bias_attr,
+                    shape=[embed_dim],
+                    is_bias=True,
+                    dtype=self._norm_weight_dtype,
+                )
+
+            # Note(Zhengzekang): Weightonly need weight is ColMajor layout.
+            qkv_weight_shape = (
+                [3 * num_heads * self.head_dim, embed_dim]
+                if trans_qkvw
+                else [embed_dim * 3 * num_heads, self.head_dim]
+            )
+            qkv_weight_scale = None
+            if self.use_weight_only:
+                if self.quant_bits == 4:
+                    qkv_weight_shape[0] //= 2
+
+                qkv_weight_scale = self.create_parameter(
+                    shape=[3 * num_heads * self.head_dim],
+                    attr=qkv_weight_scale_attr,
+                    dtype=paddle.float32,
+                    is_bias=False,
+                )
+
+            qkv_weight = self.create_parameter(
+                shape=qkv_weight_shape,
+                attr=qkv_weight_attr,
+                dtype=self.create_params_type,
+                is_bias=False,
+            )
+
+            qkv_bias = None
+            if qkv_bias_attr:
+                qkv_bias = self.create_parameter(
+                    shape=[3 * num_heads * self.head_dim],
+                    attr=qkv_bias_attr,
+                    dtype=self._dtype,
+                    is_bias=True,
+                )
+
+            linear_weight_shape = [num_heads * self.head_dim, embed_dim]
+            linear_weight_scale = None
+            if self.use_weight_only:
+                linear_weight_shape = [embed_dim, num_heads * self.head_dim]
+                if self.quant_bits == 4:
+                    linear_weight_shape[0] //= 2
+
+                linear_weight_scale = self.create_parameter(
+                    shape=[embed_dim],
+                    attr=linear_weight_scale_attr,
+                    dtype=paddle.float32,
+                    is_bias=False,
+                )
+            linear_weight = self.create_parameter(
+                shape=linear_weight_shape,
+                attr=linear_weight_attr,
+                dtype=self.create_params_type,
+                is_bias=False,
+            )
+
+            linear_bias = None
+            if linear_bias_attr:
+                linear_bias = self.create_parameter(
+                    shape=[embed_dim],
+                    attr=linear_bias_attr,
+                    dtype=self._dtype,
+                    is_bias=True,
+                )
+
+            ffn_ln_scale = self.create_parameter(
+                shape=[embed_dim],
+                attr=ffn_ln_scale_attr,
+                is_bias=False,
+                default_initializer=Constant(1.0),
+                dtype=self._norm_weight_dtype,
+            )
+
+            ffn_ln_bias = None
+            if ffn_ln_bias_attr:
+                ffn_ln_bias = self.create_parameter(
+                    shape=[embed_dim],
+                    attr=ffn_ln_bias_attr,
+                    is_bias=True,
+                    dtype=self._norm_weight_dtype,
+                )
+
+            ffn1_weight_shape = (
+                [embed_dim, dim_feedforward * 2] if activation.endswith("glu") else [embed_dim, dim_feedforward]
+            )
+            ffn1_weight_scale = None
+            if self.use_weight_only:
+                ffn1_weight_shape = (
+                    [dim_feedforward * 2, embed_dim] if activation.endswith("glu") else [dim_feedforward, embed_dim]
+                )
+                if self.quant_bits == 4:
+                    ffn1_weight_shape[0] //= 2
+
+                ffn1_weight_scale = self.create_parameter(
+                    shape=[dim_feedforward * 2],
+                    attr=ffn1_weight_scale_attr,
+                    dtype=paddle.float32,
+                    is_bias=False,
+                )
+            ffn1_weight = self.create_parameter(
+                shape=ffn1_weight_shape,
+                attr=ffn1_weight_attr,
+                dtype=self.create_params_type,
+                is_bias=False,
+            )
+
+            ffn1_bias = None
+            if ffn1_bias_attr:
+                ffn1_bias = self.create_parameter(
+                    shape=[dim_feedforward * 2] if activation.endswith("glu") else [dim_feedforward],
+                    attr=ffn1_bias_attr,
+                    dtype=self._dtype,
+                    is_bias=True,
+                )
+
+            ffn2_weight_shape = [dim_feedforward, embed_dim]
+            ffn2_weight_scale = None
+            if self.use_weight_only:
+                ffn2_weight_shape = [embed_dim, dim_feedforward]
+                if self.quant_bits == 4:
+                    ffn2_weight_shape[0] //= 2
+
+                ffn2_weight_scale = self.create_parameter(
+                    shape=[embed_dim],
+                    attr=ffn2_weight_scale_attr,
+                    dtype=paddle.float32,
+                    is_bias=False,
+                )
+
+            ffn2_weight = self.create_parameter(
+                shape=ffn2_weight_shape,
+                attr=ffn2_weight_attr,
+                dtype=self.create_params_type,
+                is_bias=False,
+            )
+
+            ffn2_bias = None
+            if ffn2_bias_attr:
+                ffn2_bias = self.create_parameter(
+                    shape=[embed_dim],
+                    attr=ffn2_bias_attr,
+                    dtype=self._dtype,
+                    is_bias=True,
+                )
+
+            # tensor model parallel
+            if nranks > 1:
+                # column parallel
+                _set_var_distributed(qkv_weight)
+                _set_var_distributed(qkv_bias)
+                _set_var_distributed(ffn1_weight)
+                _set_var_distributed(ffn1_bias)
+                # row parallel
+                _set_var_distributed(linear_weight)
+                _set_var_distributed(ffn2_weight)
+
+            self.ln_scales.append(ln_scale)
+            self.ln_biases.append(ln_bias)
+            self.qkv_weights.append(qkv_weight)
+            self.qkv_biases.append(qkv_bias)
+            self.linear_weights.append(linear_weight)
+            self.linear_biases.append(linear_bias)
+
+            self.ffn_ln_scales.append(ffn_ln_scale)
+            self.ffn_ln_biases.append(ffn_ln_bias)
+            self.ffn1_weights.append(ffn1_weight)
+            self.ffn1_biases.append(ffn1_bias)
+            self.ffn2_weights.append(ffn2_weight)
+            self.ffn2_biases.append(ffn2_bias)
+
+            if self.use_weight_only:
+                self.qkv_weights_scale.append(qkv_weight_scale)
+                self.linear_weights_scale.append(linear_weight_scale)
+                self.ffn1_weights_scale.append(ffn1_weight_scale)
+                self.ffn2_weights_scale.append(ffn2_weight_scale)
+
+            _add_parameter(ln_scale)
+            _add_parameter(ln_bias)
+            _add_parameter(qkv_weight)
+            _add_parameter(qkv_bias)
+            _add_parameter(linear_weight)
+            _add_parameter(linear_bias)
+
+            _add_parameter(ffn_ln_scale)
+            _add_parameter(ffn_ln_bias)
+            _add_parameter(ffn1_weight)
+            _add_parameter(ffn1_bias)
+            _add_parameter(ffn2_weight)
+            _add_parameter(ffn2_bias)
+
+            if self.use_weight_only:
+                _add_parameter(qkv_weight_scale)
+                _add_parameter(linear_weight_scale)
+                _add_parameter(ffn1_weight_scale)
+                _add_parameter(ffn2_weight_scale)
+
+        self.dropout_rate = dropout_rate
+        self.activation = activation
+        self.name = name
+
+        from paddle.incubate.nn.functional import fused_linear
+
+        self.linear = fused_linear
+        self.one = 0
+
+    def forward(
+        self,
+        src,
+        input_ids,
+        cache_k, # [num_layers, max_block_nums, numhead, block_size, dim_head]
+        cache_v,
+        medusa_k, #[num_layers, bsz, numhead, medusa_len, dim_head]
+        medusa_v,
+        cum_offsets=None,
+        padding_offsets=None,
+        attn_mask=None,
+        medusa_position_ids=None,
+        rotary_embs=None,
+        seq_lens_encoder=None,
+        seq_lens_decoder=None,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        block_tables=None,
+        k_quant_scales=None,
+        v_quant_scales=None,
+        k_dequant_scales=None,
+        v_dequant_scales=None,
+        max_input_length=-1,
+        use_neox_rotary_style=False,
+    ):
+        r"""
+        """
+        num_layers = cache_k.shape[0]
+        assert num_layers == len(self.qkv_weights)
+        bias_residual_input = src
+        ln_out = src
+
+        for i in range(num_layers):
+            # print("i: ", i)
+            if self.normalize_before is True:
+                # layernorm
+                if i == 0:
+                    ln_out = self.norm_func(
+                        src, self.ln_scales[i], self.ln_biases[i], self._epsilon, begin_norm_axis=1
+                    )
+
+            # qkv compute
+            if self.use_weight_only:
+                qkv_out = weight_only_linear(
+                    ln_out,
+                    weight=self.qkv_weights[i],
+                    bias=self.qkv_biases[i],
+                    weight_scale=self.qkv_weights_scale[i],
+                    weight_dtype=self.weight_dtype,
+                )
+            else:
+                qkv_out = self.linear(ln_out, self.qkv_weights[i], self.qkv_biases[i], transpose_weight=True)
+            
+            # fmha
+            # VERIFYING(@wufeisheng): implement rotary_qk_variable
+            qkv_out = encode_rotary_qk_variable(qkv_out, # [token_num, 3 * num_head * dim_head]
+                                         rotary_embs, #[2, 1, max_seq_len, 1, dim_head / 2]
+                                         seq_lens_encoder, # [bs]
+                                         seq_lens_decoder, # [bs]
+                                         padding_offsets, # [token_num]
+                                         medusa_position_ids, # [bs, medusa_len]
+                                         self.num_heads,
+                                         use_neox_rotary_style)
+
+            # fetch and concat 
+            # VERIFYING(@wufeisheng): fetch cachekv from blocks and concat with k v if in tree decoding
+            q_out, k_out, v_out = medusa_qkv_transpose_split_fetch_concat(medusa_k, 
+                                                                          medusa_v,  
+                                                                          qkv_out, 
+                                                                          block_tables, 
+                                                                          cache_k, 
+                                                                          cache_v, 
+                                                                          seq_lens_encoder, 
+                                                                          seq_lens_decoder, 
+                                                                          cu_seqlens_q, 
+                                                                          cu_seqlens_k,
+                                                                          padding_offsets, 
+                                                                          input_ids,i) # [token_num, num_head, dim_head]
+
+            max_seqlen = input_ids.shape[1]
+
+            fmha_out = flash_attn_unpadded_with_mask(q_out, k_out, v_out, attn_mask,
+                                        cu_seqlens_q,
+                                        cu_seqlens_k,
+                                        max_seqlen,
+                                        max_seqlen,
+                                        1.0 / math.sqrt(q_out.shape[-1]))
+
+            # out_linear
+            if self.use_weight_only:
+                out_linear_out = weight_only_linear(
+                    fmha_out,
+                    weight=self.linear_weights[i],
+                    weight_scale=self.linear_weights_scale[i],
+                    weight_dtype=self.weight_dtype,
+                )
+            else:
+                out_linear_out = paddle.matmul(fmha_out, self.linear_weights[i])
+
+            # all_reduce
+            if self.nranks > 1:
+                dist.all_reduce(out_linear_out)
+
+            # norm + residual_add_bias
+            if self.normalize_before is True:
+                norm_out = self.norm_func(
+                    out_linear_out,
+                    norm_weight=self.ffn_ln_scales[i],
+                    norm_bias=self.ffn_ln_biases[i],
+                    epsilon=self._epsilon,
+                    begin_norm_axis=1,
+                    bias=self.linear_biases[i],
+                    residual=bias_residual_input,
+                )
+                tmp_out, bias_residual_input = norm_out[0], norm_out[1]
+            else:
+                tmp_out = self.norm_func(
+                    out_linear_out,
+                    norm_weight=self.ln_scales[i],
+                    norm_bias=self.ln_biases[i],
+                    epsilon=self._epsilon,
+                    residual_alpha=self._residual_alpha,
+                    begin_norm_axis=1,
+                    bias=self.linear_biases[i],
+                    residual=ln_out,
+                )[0]
+
+            # ffn1 matmul
+            if self.use_weight_only:
+                ffn1_out = weight_only_linear(
+                    tmp_out,
+                    weight=self.ffn1_weights[i],
+                    weight_scale=self.ffn1_weights_scale[i],
+                    weight_dtype=self.weight_dtype,
+                )
+            else:
+                ffn1_out = paddle.matmul(tmp_out, self.ffn1_weights[i])
+            ffn1_out = fused_act_bias_wrapper(ffn1_out, self.ffn1_biases[i], act_method=self.activation)
+
+            # ffn2 matmul
+            if self.use_weight_only:
+                ffn2_out = weight_only_linear(
+                    ffn1_out,
+                    weight=self.ffn2_weights[i],
+                    weight_scale=self.ffn2_weights_scale[i],
+                    weight_dtype=self.weight_dtype,
+                )
+            else:
+                ffn2_out = paddle.matmul(ffn1_out, self.ffn2_weights[i])
+
+            # all_reduce
+            if self.nranks > 1:
+                dist.all_reduce(ffn2_out)
+
+            # norm + residual_add_bias
+            if self.normalize_before is True:
+                if i != len(caches) // 2 - 1:
+                    norm_out = self.norm_func(
+                        ffn2_out,
+                        norm_weight=self.ln_scales[i + 1],
+                        norm_bias=self.ln_biases[i + 1],
+                        epsilon=self._epsilon,
+                        begin_norm_axis=1,
+                        bias=self.ffn2_biases[i],
+                        residual=bias_residual_input,
+                    )
+                    tmp_out, bias_residual_input = norm_out[0], norm_out[1]
+                else:
+                    tmp_out = fused_layer_norm(
+                        ffn2_out,
+                        norm_weight=None,
+                        norm_bias=None,
+                        epsilon=self._epsilon,
+                        begin_norm_axis=1,
+                        bias=self.ffn2_biases[i],
+                        residual=bias_residual_input,
+                    )[0]
+            else:
+                tmp_out = self.norm_func(
+                    ffn2_out,
+                    norm_weight=self.ffn_ln_scales[i],
+                    norm_bias=self.ffn_ln_biases[i],
+                    epsilon=self._epsilon,
+                    residual_alpha=self._residual_alpha,
+                    begin_norm_axis=1,
+                    bias=self.ffn2_biases[i],
+                    residual=tmp_out,
+                )[0]
+
+            ln_out = tmp_out
+
+        out = tmp_out
+        return out

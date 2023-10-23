@@ -13,11 +13,13 @@
 # limitations under the License.
 from __future__ import annotations
 
+TOPK = 10
+
 import glob
 import math
 import os
 import struct
-from typing import Dict, Optional
+from typing import Dict, Optional 
 
 import numpy as np
 import paddle
@@ -30,6 +32,8 @@ from paddlenlp.datasets import InTokensIterableDataset
 from paddlenlp.trainer import Trainer, TrainerCallback
 from paddlenlp.trainer.trainer_utils import IterableDatasetShard, has_length
 from paddlenlp.utils.log import logger
+
+
 
 
 def compute_metrics(eval_preds):
@@ -584,3 +588,122 @@ def load_real_time_tokens():
     os.system("rm -f ./real_time_save.temp_ids_rank_*")
     tokens = np.concatenate(tokens, axis=1)
     return tokens
+
+
+def pad_path(path, length, pad_value=-2):
+    """
+    Pad the given path list with a specific value up to a specified length.
+    
+    Parameters:
+    - path (list): The original list that needs padding.
+    - length (int): The desired length of the padded list.
+    - pad_value (optional, default=-2): The value to use for padding.
+    
+    Returns:
+    - list: A new list based on the original path but padded to the desired length.
+    
+    Example:
+    >>> pad_path([1,2,3], 5)
+    [1, 2, 3, -2, -2]
+    
+    Note:
+    If the given path is already longer than the specified length, 
+    then no padding occurs, and the original path is returned.
+    """
+    
+    # Calculate the number of padding values needed by subtracting the length
+    # of the path from the desired length.
+    # Append the padding values to the original path and return the new list.
+    return path + [pad_value] * (length - len(path))
+
+def generate_medusa_buffers(medusa_choices):
+    """
+    Generate buffers for the Medusa structure based on the provided choices.
+    
+    Parameters:
+    - medusa_choices (list): A nested list representing tree in the Medusa structure.
+    
+    Returns:
+    - dict: A dictionary containing buffers related to the Medusa structure.
+    """
+
+    # Sort the medusa_choices based on their lengths and then their values
+    sorted_medusa_choices = sorted(medusa_choices, key=lambda x: (len(x), x))
+    medusa_len = len(sorted_medusa_choices) + 1
+    # # import pdb;pdb.set_trace()
+
+
+    # Initialize depth_counts to keep track of how many choices have a particular depth
+    depth_counts = []
+    prev_depth = 0
+    for path in sorted_medusa_choices:
+        depth = len(path)
+        if depth != prev_depth:
+            depth_counts.append(0)
+        depth_counts[depth - 1] += 1
+        prev_depth = depth
+    
+    # Create the attention mask for Medusa
+    medusa_attn_mask = paddle.eye(medusa_len, medusa_len)
+    medusa_attn_mask[:, 0] = 1
+    start = 0
+    for i in range(len(depth_counts)):
+        for j in range(depth_counts[i]):
+            cur_medusa_choice = sorted_medusa_choices[start + j]
+            # retrieve ancestor position
+            if len(cur_medusa_choice) == 1:
+                continue
+            ancestor_idx = []
+            for c in range(len(cur_medusa_choice) - 1):
+                ancestor_idx.append(sorted_medusa_choices.index(cur_medusa_choice[:c+1]) + 1)
+            medusa_attn_mask[j + start + 1, ancestor_idx] = 1
+        start += depth_counts[i]
+
+    # # import pdb;pdb.set_trace()
+    # Generate tree indices for the Medusa structure
+    medusa_tree_indices = paddle.zeros(medusa_len, dtype='int64')
+    medusa_tree_indices[0] = 0
+    start = 0
+    for i in range(len(depth_counts)):
+        for j in range(depth_counts[i]):
+            cur_medusa_choice = sorted_medusa_choices[start + j]
+            medusa_tree_indices[start + j + 1] = cur_medusa_choice[-1] + TOPK * i + 1
+        start += depth_counts[i]
+
+    # # import pdb;pdb.set_trace()
+    # Generate position IDs for the Medusa structure
+    medusa_position_ids = paddle.zeros(medusa_len, dtype='int64')
+    start = 0
+    for i in range(len(depth_counts)):
+        medusa_position_ids[start + 1: start + depth_counts[i] + 1] = i + 1
+        start += depth_counts[i]
+
+    # # import pdb;pdb.set_trace()
+    # Generate retrieval indices for Medusa structure verification
+    retrieve_indices_nest = []
+    retrieve_paths = []
+    for i in range(len(sorted_medusa_choices)):
+        cur_medusa_choice = sorted_medusa_choices[-i-1]
+        retrieve_indice = []
+        if cur_medusa_choice in retrieve_paths:
+            continue
+        else:
+            for c in range(len(cur_medusa_choice)):
+                retrieve_indice.append(sorted_medusa_choices.index(cur_medusa_choice[:c+1]))
+                retrieve_paths.append(cur_medusa_choice[:c+1])
+        retrieve_indices_nest.append(retrieve_indice)
+    max_length = max([len(x) for x in retrieve_indices_nest])
+    retrieve_indices = [pad_path(path, max_length) for path in retrieve_indices_nest]
+    retrieve_indices = paddle.to_tensor(retrieve_indices, dtype='int64')
+    retrieve_indices = retrieve_indices + 1
+    retrieve_indices = paddle.cat([paddle.zeros((retrieve_indices.shape[0], 1), dtype='int64'), retrieve_indices], dim=1)
+
+    # # import pdb;pdb.set_trace()
+    # Aggregate the generated buffers into a dictionary
+    medusa_buffers = {
+        "medusa_attn_mask": medusa_attn_mask.unsqueeze(0).unsqueeze(0),
+        "tree_indices": medusa_tree_indices,
+        "medusa_position_ids": medusa_position_ids,
+        "retrieve_indices": retrieve_indices,
+        }
+    return medusa_buffers

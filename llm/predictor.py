@@ -824,6 +824,42 @@ class DygraphBlockInferencePredictor(BasePredictor):
                 self.inputs["block_tables"][i : i + 1, bi] = bi_now
 
 
+from .utils import generate_medusa_buffers
+from .medusa_choices import mc_sim_7b_63
+class DygraphMedusaBlockInferencePredictor(DygraphBlockInferencePredictor):
+    def __init__(self, config: PredictorArgument, model: PretrainedModel = None, tokenizer: PretrainedTokenizer = None):
+        super().__init__(config, model, tokenizer)
+        medusa_inputs = generate_medusa_buffers(mc_sim_7b_63)
+        self.inputs["medusa_attn_mask"] = medusa_inputs["medusa_attn_mask"]
+        self.inputs["tree_indices"] = medusa_inputs["tree_indices"]
+        self.inputs["medusa_position_ids"] = medusa_inputs["medusa_position_ids"]
+        self.inputs["retrieve_indices"] = medusa_inputs["retrieve_indices"]
+
+        medusa_len = medusa_inputs["tree_indices"].shape[0]
+
+        medusa_kv_shape = model.get_medusa_kvs_shape(model.config, config.batch_size, medusa_len)
+        self.inputs["medusa_k"] = paddle.zeros(medusa_kv_shape, dtype=self.dtype)
+        self.inputs["medusa_v"] = paddle.zeros(medusa_kv_shape, dtype=self.dtype)
+
+        cache_kv_shape = model.get_cache_kvs_shape(model.config, config.batch_size)
+
+
+        if config.use_cachekv_int8:
+            self.cache_k = paddle.zeros(cache_kv_shape, dtype="uint8") 
+            self.cache_v = paddle.zeros(cache_kv_shape, dtype="uint8") 
+        else:
+            self.cache_k = paddle.zeros(cache_kv_shape, dtype=self.dtype) 
+            self.cache_v = paddle.zeros(cache_kv_shape, dtype=self.dtype) 
+
+        self.inputs["cache_k"] = self.cache_k
+        self.inputs["cache_v"] = self.cache_v
+
+
+
+
+
+
+
 class StaticBlockInferencePredictor(BasePredictor):
     def __init__(
         self,
