@@ -53,7 +53,12 @@ setup(
             # "./generation/write_int8_cache_kv.cu",
             # "./generation/medusa_rotary_qk_variable.cu",
             # "./generation/medusa_qkv_transpose_split_fetch_concat.cu",
-            "./generation/medusa_rebuild_logits.cu"
+            # "./generation/medusa_rebuild_logits.cu",
+            # "./generation/medusa_set_stop_value_multi_ends.cu",
+            # "./generation/medusa_save_with_output_msg.cc",
+            # "./generation/medusa_write_kv.cu"
+            # "./generation/medusa_gather.cu",
+            "./generation/medusa_update_inputs.cu",
         ],
         extra_compile_args={
             "cxx": ["-O3"],

@@ -24,6 +24,10 @@ from paddlenlp_ops import (
     get_padding_offset,
     get_padding_offset_v2,
     medusa_rebuild_logits,
+    medusa_set_stop_value_multi_ends,
+    medusa_save_output,
+    medusa_write_kv,
+    medusa_gather,
 )
 
 from paddlenlp.experimental.transformers.fused_transformer_layers import (
@@ -1484,7 +1488,8 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
         input_ids = kwargs["input_ids"]
         src_mask = kwargs.get("src_mask", None)
         block_tables = kwargs.get("block_tables", None)
-        caches = kwargs.get("caches", None)
+        cache_k = kwargs.get("cache_k", None)
+        cache_v = kwargs.get("cache_v", None)
         medusa_k = kwargs.get("medusa_k", None) #输入：占位就可以了 后处理的时候更新到cachekv里面 
         medusa_v = kwargs.get("medusa_v", None)
 
@@ -1601,22 +1606,23 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
         probabilities to select the best candidate.
 
         Args:
-        - logits (torch.Tensor): Predicted logits of shape (batch_size, sequence_length, vocab_size).
-        - candidates (torch.Tensor): Candidate token sequences.
+        - logits ([num_decoders, num_posterior, self.medusa+1, vocab_size]).
+        - candidates   [num_decoders, num_posterior, self.medusa+1]
         - temperature (float): Softmax temperature for probability scaling. A value of 0 indicates greedy decoding.
         - posterior_threshold (float): Threshold for posterior probability.
         - posterior_alpha (float): Scaling factor for the threshold.
 
         Returns:
-        - best_candidate (torch.Tensor): Index of the chosen best candidate.
-        - accept_length (int): Length of the accepted candidate sequence.
+        - best_candidate [num_decoders]
+        - accept_lengths [num_decoders]
         """
         
         # Calculate posterior probabilities and thresholds for candidate selection
-        posterior_prob = paddle.softmax(logits[:, :-1] / temperature, dim=-1)
-        candidates_prob = paddle.gather(
-            posterior_prob, dim=-1, index=candidates[:, 1:].unsqueeze(-1)
-        ).squeeze(-1)
+        posterior_prob = paddle.softmax(logits[:, :, :-1] / temperature, dim=-1)
+        # candidates_prob = paddle.gather(
+        #     posterior_prob, dim=-1, index=candidates[:, :,1:].unsqueeze(-1)).squeeze(-1)
+        candidates_prob = medusa_gather(posterior_prob, candidates[:, :,1:]) # [num_decoders, num_posterior, self.medusa]
+
         posterior_entropy = -paddle.sum(
             posterior_prob * paddle.log(posterior_prob + 1e-5), dim=-1
         )  
@@ -1625,61 +1631,55 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
             paddle.exp(-posterior_entropy) * posterior_alpha,
         )
         posterior_mask = candidates_prob > threshold
-        candidates_accept_length = (paddle.cumprod(posterior_mask, dim=1)).sum(dim=1)
+        candidates_accept_length = (paddle.cumprod(posterior_mask, dim=2)).sum(dim=2) # [num_decoders, num_posterior]
 
         # Choose the best candidate based on the evaluated posterior probabilities
-        accept_length = candidates_accept_length.max()
-        if accept_length == 0:
-            # If no candidates are accepted, just choose the first one
-            best_candidate = paddle.to_tensor([0], dtype='int64', device=candidates.device)
-        else:
-            best_candidates = paddle.where(candidates_accept_length == accept_length)[0]
-            # Accept the best one according to likelihood
-            likelihood = paddle.sum(
-                paddle.log(candidates_prob[best_candidates, :accept_length]), dim=-1
-            )
-            best_candidate = best_candidates[paddle.argmax(likelihood)]
+        accept_length = candidates_accept_length.max(axis=1) # [num_decoders]
+        # best_candidates = paddle.where(candidates_accept_length == accept_length)
+        best_candidates = candidates_accept_length.argmax(axis=1) # [num_decoders]
 
-        return best_candidate, accept_length
+        return best_candidates, accept_length
 
     def generate_candidates(self, medusa_logits, logits, tree_indices, retrieve_indices):
         """
         Generate candidates based on provided logits and indices.
         
         Parameters:
-        - medusa_logits (torch.Tensor): Logits associated with the Medusa structure.
-        - logits (torch.Tensor): Original logits.
-        - tree_indices (list or torch.Tensor): Indices associated with a tree structure.
-        - retrieve_indices (list or torch.Tensor): Indices for retrieving candidates.
+        - medusa_logits [4, bsz, vocab_size]
+        - logits (torch.Tensor): [bsz, vocab_size]]
+        - tree_indices [medusa_len]
+        - retrieve_indices [num_posterior, self.medusa+1]
         
         Returns:
         - tuple: Returns cartesian candidates and tree candidates.
         """
         # import pdb;pdb.set_trace()
         # Greedy decoding: Select the most probable candidate from the original logits.
-        candidates_logit = paddle.argmax(logits[:, -1]).unsqueeze(0)
+        candidates_logit = paddle.argmax(logits) #[bsz, 1]
         TOPK = 10
 
         # import pdb;pdb.set_trace()
         # Extract the TOPK candidates from the medusa logits.
-        candidates_medusa_logits = paddle.topk(medusa_logits[:, 0, -1], TOPK, dim = -1).indices
+        candidates_medusa_logits = paddle.topk(medusa_logits, TOPK, axis = -1)[1] # [4, bsz, 10]
+        bsz = candidates_medusa_logits.shape[1]
+        candidates_medusa_logits = candidates_medusa_logits.transpose_((1, 0, 2)).reshape_([bsz, -1]) # [bsz, 40]
 
         # import pdb;pdb.set_trace()
         # Combine the selected candidate from the original logits with the topk medusa logits.
-        candidates = paddle.cat([candidates_logit, candidates_medusa_logits.reshape_([-1])], dim=-1)
+        candidates = paddle.stack([candidates_logit, candidates_medusa_logits], axis=-1) # [bsz, 41]
 
         # Map the combined candidates to the tree indices to get tree candidates.
-        tree_candidates = candidates[tree_indices]
+        tree_candidates = candidates[:, tree_indices] # [bsz, medusa_len-1]
 
         # Extend the tree candidates by appending a zero.
-        tree_candidates_ext = paddle.cat([tree_candidates, paddle.zeros((1), dtype='int64', device=tree_candidates.device)], dim=0)
+        tree_candidates_ext = paddle.stack([tree_candidates, paddle.zeros((bsz, 1), dtype='int64', device=tree_candidates.device)], axis=-1)
 
         # Retrieve the cartesian candidates using the retrieve indices.
-        cart_candidates = tree_candidates_ext[retrieve_indices]
+        cart_candidates = tree_candidates_ext[:, retrieve_indices] # [bsz, num_posterior, self.medusa+1]
 
         # import pdb;pdb.set_trace()
         # Unsqueeze the tree candidates for dimension consistency.
-        tree_candidates = tree_candidates.unsqueeze(0)
+        # tree_candidates = tree_candidates.unsqueeze(0)
         return cart_candidates, tree_candidates
 
     def sample(
@@ -1699,25 +1699,41 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
             model_inputs = self.prepare_inputs_for_generation(**args)
             return self(**model_inputs)
 
-        def _post_process_(candidates, best_candidate, accept_length, tree_candidates, cache_k, cache_v, medusa_k, medusa_v, retrieve_indices):
+        def _post_process_(candidates, best_candidate, accept_lengths, insert_index_decoder, cache_k, cache_v, medusa_k, medusa_v, retrieve_indices, arrange_num_decoders):
+            if candidates is None: return None
+
             # 根据candidates 拉取next tokens
-            next_tokens = candidates[:,best_candidate][:accept_length]
+            next_tokens = candidates[arrange_num_decoders,best_candidate] # [num_decoders, self.medusa+1] 有padding 为-1
 
             # 确定是否停止
+            step_idx = paddle.where(model_kwargs["stop_flags"], model_kwargs["step_idx"], model_kwargs["step_idx"] + 1)
+            paddle.assign(step_idx, model_kwargs["step_idx"])
+
             length_cond = paddle.greater_equal(model_kwargs["step_idx"], model_kwargs["max_dec_len"])
             stop_flags = paddle.logical_or(model_kwargs["stop_flags"], length_cond)
 
-            # TODO(@wufeisheng): 这里也要根据新的next_token重新设计
-            set_stop_value_multi_ends_v2(
-                next_tokens, stop_flags, model_kwargs["seq_lens_this_time"], eos_token_id
+            # Verifying(@wufeisheng): 这里也要根据新的next_token重新设计
+            medusa_set_stop_value_multi_ends(
+                next_tokens, stop_flags, model_kwargs["seq_lens_this_time"], eos_token_id, accept_lengths, insert_index_decoder
             )  # multi ends
             paddle.assign(stop_flags, model_kwargs["stop_flags"])
 
-            # TODO(@wufeisheng): 实现新的saveoutput 因为encoder不输出token，deocder输出多个token
-            save_output(next_tokens, model_kwargs["not_need_stop"], self.config.tensor_parallel_rank)
+            # Verifying(@wufeisheng): 实现新的saveoutput 因为encoder不输出token，deocder输出多个token
+            medusa_save_output(next_tokens, accept_lengths, insert_index_decoder, model_kwargs["not_need_stop"], self.config.tensor_parallel_rank)
 
             # TODO(@wufeisheng): cache_k cache_v的更新
-            update_cachekv(cache_k, cache_v, medusa_k, medusa_v, best_candidate, accept_length, tree_candidates, retrieve_indices)
+            # cache_k/v: [num_layers, max_block_nums, numhead, block_size, dim_head]
+            # medusa k/v: [num_layers, bsz, numhead, medusa_len, dim_head]
+            # 1. retrieve medusa k/v -> [num_layers, bsz, numhead, num_posterior, self.medusa+1, dim_head]
+            medusa_k = medusa_k[:,:,:,retrieve_indices]
+            medusa_v = medusa_v[:,:,:,retrieve_indices],
+
+            # 2. select target medusa kv->[num_layers, num_decoders, numhead, self.medusa+1, dim_head]
+            medusa_k = medusa_k[:, insert_index_decoder][:,arrange_num_decoders, :, best_candidate]
+            medusa_v = medusa_v[:, insert_index_decoder][:,arrange_num_decoders, :, best_candidate]
+            
+            # 3. write medusa_k/v to cachek/v
+            medusa_write_kv(cache_k, cache_v, medusa_k, medusa_v, model_kwargs["block_tables"], accept_lengths, model_kwargs["seq_lens_decoder"], insert_index_decoder)
 
             return next_tokens
 
@@ -1726,46 +1742,55 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
 
         # tree_orig_logits [token_num, vocab_size] -> [num_decoders, num_posterior, self.medusa+1, vocab_size]  对于decoder需要确定某一个路径
         # -> [num_encoders, vocab_size] 对于encoder拉取对应的logits
-        # 这里产生一个[num_decoders] 和 [num_encoders] 的索引 用于在[bsz]中填充
 
-        # tree_combined_medusa_logits [4, token_num, vocab_size]也要变成 [4, num_decoders,medusa_len, vocab_size] [4, num_encoders, vocab_size]
+        # insert_index_decoder[num_decoders] 和 insert_index_encoder[num_encoders] 的索引 用于在[bsz]中填充
+
+        # tree_combined_medusa_logits [4, token_num, vocab_size]-> [4, num_decoders, num_posterior, self.medusa+1, vocab_size] 
+        # ->[4, num_encoders, vocab_size]
 
         logits_decoder_index,  logits_encoder_index, insert_index_decoder, insert_index_encoder = medusa_rebuild_logits(model_kwargs["seq_lens_encoder"],model_kwargs["seq_lens_decoder"], 
                                                             padding_offset, model_kwargs["input_ids"], model_kwargs["retrieve_indices"])
 
         orig_logits_decoder,  orig_logits_encoder= tree_orig_logits[logits_decoder_index], tree_orig_logits[logits_encoder_index]
-        orig_logits_decoder = orig_logits_decoder[:, model_kwargs["retrieve_indices"]]
+        orig_logits_decoder = orig_logits_decoder[:, model_kwargs["retrieve_indices"]] 
         combined_medusa_logits_decoder, combined_medusa_logits_encoder = tree_combined_medusa_logits[:,logits_decoder_index], tree_combined_medusa_logits[:,logits_encoder_index]
+        combined_medusa_logits_decoder = combined_medusa_logits_decoder[:,:,model_kwargs["retrieve_indices"]]
 
 
-        # combined_medusa_logits [4, num_decoders, medusa_len, vocab_size] 在路径选择结束后变成 [4, num_decoders, vocab_size]
+        # combined_medusa_logits [4, num_decoders, num_posterior, self.medusa+1, vocab_size] 在路径选择结束后变成 [4, num_decoders, vocab_size]
 
         # Evaluate posterior
-        # model_kwargs["medusa_candidates"] : [bsz, num_posterior, self.medusa+1]
-        # 这里需要返回一个[4, num_decoders]的索引best_medusa_token_index，选出1/medusa 的那个token
-        best_candidate, accept_length, best_medusa_token_index = self.evaluate_posterior(orig_logits_decoder, model_kwargs["medusa_candidates"], temperature, 0.09, 0.3)
-        # best_candidate [num_decoders]
-        combined_medusa_logits_decoder = combined_medusa_logits_decoder[best_medusa_token_index].squeeze()
+
+        # model_kwargs["medusa_candidates"] : [num_decoders, num_posterior, self.medusa+1]
+        best_candidates, accept_lengths = self.evaluate_posterior(orig_logits_decoder, model_kwargs["medusa_candidates"], temperature, 0.09, 0.3)
+        # best_candidate [num_decoders], accept_lengths [num_decoders]
 
 
-        # 这里还要做一些事情 比如 流式输出, KV 拼接
-        next_tokens = _post_process_(model_kwargs["medusa_candidates"], best_candidate, accept_length, tree_candidates, model_kwargs["cache_k"], model_kwargs["cache_v"], model_kwargs["medusa_k"], model_kwargs["medusa_v"])
+        # 确定是否停止，流式输出, KV 拼接
+
+        num_decoders = model_kwargs["medusa_candidates"].shape[0]
+        arrange_num_decoders = paddle.arange(num_decoders)
+        _post_process_(model_kwargs["medusa_candidates"], best_candidates, accept_lengths, model_kwargs["cache_k"], model_kwargs["cache_v"], model_kwargs["medusa_k"], model_kwargs["medusa_v"], model_kwargs["retrieve_indices"], arrange_num_decoders)
 
         # Get candidates
+        bsz = model_kwargs["input_ids"].shape[0]
+        vocab_size = tree_orig_logits.shape[1]
         combined_medusa_logit = paddle.ones(shape=[4, bsz, vocab_size], dtype=orig_logits_decoder.dtype)
         combined_medusa_logit[:, insert_index_encoder] = combined_medusa_logits_encoder
-        combined_medusa_logit[:, insert_index_decoder] = combined_medusa_logits_decoder
+        combined_medusa_logits_decoder = combined_medusa_logits_decoder[:, arrange_num_decoders, best_candidates]
+        combined_medusa_logit[:, insert_index_decoder] = combined_medusa_logits_decoder 
+
         orig_logits = paddle.ones(shape=[bsz, vocab_size], dtype=orig_logits_decoder.dtype)
         orig_logits[insert_index_encoder] = orig_logits_encoder
-        orig_logits[insert_index_decoder] = orig_logits_decoder
+        orig_logits_decoder = orig_logits_decoder[arrange_num_decoders, best_candidates]
+        orig_logits[insert_index_decoder] = orig_logits_decoder 
 
         model_kwargs["medusa_candidates"], tree_candidates = self.generate_candidates(combined_medusa_logit, orig_logits, model_kwargs["tree_indices"], model_kwargs["retrieve_indices"])
 
         # update input_ids 和其他变量
-        # input_ids 对于decoder来说就是tree_candidates, 对于encoder来说就是正常的输入
+        # input_ids 对于decoder来说就是tree_candidates[bsz, medusa_len], 对于encoder来说就是正常的输入
         # TODO(@wufeisheng): 实现新的update
-        update_inputs(
-            tree_candidates,
+        medusa_update_inputs(
             model_kwargs["stop_flags"],
             model_kwargs["not_need_stop"],
             model_kwargs["seq_lens_this_time"],
@@ -1773,7 +1798,7 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
             model_kwargs["seq_lens_decoder"],
             model_kwargs["input_ids"],
             model_kwargs["stop_nums"],
-            next_tokens,
+            tree_candidates,
         )
 
         

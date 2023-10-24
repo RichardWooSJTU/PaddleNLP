@@ -61,10 +61,10 @@ __global__ void GetNumDecoder(int* result,
 
 }
 
-__global__ void MedusaRebuildLogitsKernel(int64_t* logits_decoder_index, // num_decoders, medusa_len
-                                          int64_t* logits_encoder_index, // num_encoders
-                                        int64_t* insert_index_decoder, //[num_decoder]
-                                        int64_t* insert_index_encoder, //[num_encoder]
+__global__ void MedusaRebuildLogitsKernel(int* logits_decoder_index, // num_decoders, medusa_len
+                                          int* logits_encoder_index, // num_encoders
+                                        int* insert_index_decoder, //[num_decoder]
+                                        int* insert_index_encoder, //[num_encoder]
                                           const int* seq_lens_encoder, //[bsz]
                                           const int* seq_lens_decoder, //[bsz]
                                           const int* padding_offsets, // [token_num]
@@ -120,16 +120,16 @@ std::vector<paddle::Tensor> MedusaRebuildLogits(const paddle::Tensor& seq_lens_e
 
     int num_encoders = bsz - num_decoders;
 
-    auto insert_index_encoder = paddle::empty({num_encoders}, paddle::DataType::INT64);
-    auto insert_index_decoder = paddle::empty({num_decoders}, paddle::DataType::INT64);
+    auto insert_index_encoder = paddle::empty({num_encoders}, paddle::DataType::INT32);
+    auto insert_index_decoder = paddle::empty({num_decoders}, paddle::DataType::INT32);
 
-    auto logits_encoder_index = paddle::empty({num_encoders}, paddle::DataType::INT64);
-    auto logits_decoder_index = paddle::empty({num_decoders, medusa_len}, paddle::DataType::INT64);
+    auto logits_encoder_index = paddle::empty({num_encoders}, paddle::DataType::INT32);
+    auto logits_decoder_index = paddle::empty({num_decoders, medusa_len}, paddle::DataType::INT32);
 
-    MedusaRebuildLogitsKernel<<<token_num, 512, 0, cu_stream>>>(logits_decoder_index.data<int64_t>(),
-                                                                logits_decoder_index.data<int64_t>(),
-                                                                insert_index_decoder.data<int64_t>(),
-                                                                insert_index_encoder.data<int64_t>(),
+    MedusaRebuildLogitsKernel<<<token_num, 512, 0, cu_stream>>>(logits_decoder_index.data<int>(),
+                                                                logits_decoder_index.data<int>(),
+                                                                insert_index_decoder.data<int>(),
+                                                                insert_index_encoder.data<int>(),
                                                                 seq_lens_encoder.data<int>(),
                                                                 seq_lens_decoder.data<int>(),
                                                                 padding_offsets.data<int>(),
@@ -159,7 +159,7 @@ std::vector<paddle::DataType> MedusaRebuildLogitsInferDtype(
                                                             const paddle::DataType& padding_offsets_dtype,
                                                             const paddle::DataType& input_ids_dtype,
                                                             const paddle::DataType& retrieve_indices_dtype) {
-    return {paddle::DataType::INT64, paddle::DataType::INT64, paddle::DataType::INT64, paddle::DataType::INT64};
+    return {paddle::DataType::INT32, paddle::DataType::INT32, paddle::DataType::INT32, paddle::DataType::INT32};
 }
 
 

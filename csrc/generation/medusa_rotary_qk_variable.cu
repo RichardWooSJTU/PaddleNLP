@@ -132,7 +132,7 @@ void LaunchMedusaRotaryQKVariable(const paddle::Tensor& qkv,
                                                             dim_head,
                                                             medusa_len);
     } else {
-        
+        // skip
     }
 }
 

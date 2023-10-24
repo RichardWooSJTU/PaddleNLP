@@ -31,17 +31,23 @@ __global__ void MedusaQKVTransposeSplitKernel(T* medusa_k,
                                               int medusa_len,
                                               int seq_len) {
     // 1. Transpose qkv from [token_num, 3, num_head, dim_head] to [token_num, num_head, dim_head]  2 * [k_tokens_num, num_head, dim_head]
-    // 2. Store to medusa_k/v [bsz, numhead, medusa_len, dim_head]
+    // 2. Store to medusa_k/v [num_decoders, numhead, medusa_len, dim_head]
 
     const int token_idx = blockIdx.x;
     const int ori_token_idx = token_idx + padding_offsets[token_idx];
     const int ori_bi = ori_token_idx / seq_len;
     int seq_len_decoder = seq_lens_decoder[ori_bi];
+    if (seq_len_decoder == 0) return;
     const int k_token_idx = ori_bi == 0 ? seq_len_decoder : cu_seqlens_k[ori_bi-1] + seq_len_decoder;
 
 
     const int hidden_size = num_head * dim_head;
     using InVec = AlignedVector<T, VecSize>;
+
+    int decoder_id = -1;
+    for (int i = 0; i <= ori_bi; i++) {
+        decoder_id += (seq_len_decoder != 0);
+    }
 
     InVec in_vec;
     for (int idx = threadIdx.x * VecSize; idx < 3 * num_head * dim_head; idx += blockDim.x * VecSize) {
@@ -53,10 +59,10 @@ __global__ void MedusaQKVTransposeSplitKernel(T* medusa_k,
             Store<T, VecSize>(in_vec, q_out + token_idx * hidden_size + h_id * dim_head + h_offset);
         } else if (qkv_id == 1) {
             Store<T, VecSize>(in_vec, k_out + k_token_idx * hidden_size + h_id * dim_head + h_offset);  
-            Store<T, VecSize>(in_vec, medusa_k + ori_bi * num_head * medusa_len * dim_head + h_id * medusa_len * dim_head + (ori_token_idx % seq_len) * dim_head + h_offset);  
+            Store<T, VecSize>(in_vec, medusa_k + decoder_id * num_head * medusa_len * dim_head + h_id * medusa_len * dim_head + (ori_token_idx % seq_len) * dim_head + h_offset);  
         } else {
             Store<T, VecSize>(in_vec, v_out + k_token_idx * hidden_size + h_id * dim_head + h_offset);
-            Store<T, VecSize>(in_vec, medusa_v + ori_bi * num_head * medusa_len * dim_head + h_id * medusa_len * dim_head + (ori_token_idx % seq_len) * dim_head + h_offset);
+            Store<T, VecSize>(in_vec, medusa_v + decoder_id * num_head * medusa_len * dim_head + h_id * medusa_len * dim_head + (ori_token_idx % seq_len) * dim_head + h_offset);
         }
     }
 }
@@ -65,9 +71,9 @@ template<typename T, int VecSize>
 __global__ void MedusaFetchCacheKVKernel(
                                         T* k_out, // [k_token_num, num_head, dim_head]
                                         T* v_out,
+                                        T* cache_k, // [max_block_nums, numhead, block_size, dim_head]
+                                        T* cache_v, 
                                         const int* block_tables, // [batch_size, pre_max_block_num]
-                                        const T* cache_k, // [max_block_nums, numhead, block_size, dim_head]
-                                        const T* cache_v, 
                                         const int* seq_lens_decoder,
                                         const int* cu_seqlens_k,
                                         int num_head,
@@ -75,47 +81,75 @@ __global__ void MedusaFetchCacheKVKernel(
                                         int pre_max_block_num,
                                         int block_size) {
     const int b_id = blockIdx.x;
-    const int base_id = b_id == 0 ? 0 : cu_seqlens_k[b_id];
+    const int base_id = cu_seqlens_k[b_id];
     const int seq_len = seq_lens_decoder[b_id];
 
-
-
-    if (seq_len == 0) return;
 
     using InVec = AlignedVector<T, VecSize>;
 
     InVec k_vec;
     InVec v_vec;
-    
-    for (int idx = threadIdx.x * VecSize; idx < num_head * seq_len * dim_head; idx += blockDim.x * VecSize) {
 
-        int h_id = idx / (seq_len * dim_head);
-        int local_token_id = (idx % (seq_len * dim_head)) / dim_head;
-        int h_offset = idx % dim_head;
+    if (seq_len == 0) {
+        int src_len = cu_seqlens_k[b_id+1] - base_id;
+        for (int idx = threadIdx.x * VecSize; idx < num_head * src_len  * dim_head; idx += blockDim.x * VecSize) {
+            int h_id = idx / (src_len * dim_head);
+            int local_token_id = (idx % (src_len * dim_head)) / dim_head;
+            int h_offset = idx % dim_head;
+
+            int block_table_offset = local_token_id / block_size;
+            int block_offset = local_token_id % block_size;
+            int block_idx = *(block_tables + b_id * pre_max_block_num + block_table_offset);
+
+            Load<T, VecSize>(k_out + (base_id + local_token_id) * num_head * dim_head + h_id * dim_head + h_offset, &k_vec);
+            Load<T, VecSize>(v_out + (base_id + local_token_id) * num_head * dim_head + h_id * dim_head + h_offset, &v_vec);
+
+            Store<T, VecSize>(k_vec, cache_k + 
+                            block_idx * num_head * block_size * dim_head + 
+                            h_id * block_size * dim_head +
+                            block_offset * dim_head + 
+                            h_offset);
+
+            Store<T, VecSize>(v_vec, cache_v + 
+                            block_idx * num_head * block_size * dim_head + 
+                            h_id * block_size * dim_head +
+                            block_offset * dim_head + 
+                            h_offset);
+        }
+    } else {
+        for (int idx = threadIdx.x * VecSize; idx < num_head * seq_len * dim_head; idx += blockDim.x * VecSize) {
+
+            int h_id = idx / (seq_len * dim_head);
+            int local_token_id = (idx % (seq_len * dim_head)) / dim_head;
+            int h_offset = idx % dim_head;
 
 
-        int block_table_offset = local_token_id / block_size;
-        int block_offset = local_token_id % block_size;
-        int block_idx = *(block_tables + b_id * pre_max_block_num + block_table_offset);
+            int block_table_offset = local_token_id / block_size;
+            int block_offset = local_token_id % block_size;
+            int block_idx = *(block_tables + b_id * pre_max_block_num + block_table_offset);
 
-        Load<T, VecSize>(cache_k + 
-                        block_idx * num_head * block_size * dim_head + 
-                        h_id * block_size * dim_head +
-                        block_offset * dim_head + 
-                        h_offset, 
-                        &k_vec);
+            Load<T, VecSize>(cache_k + 
+                            block_idx * num_head * block_size * dim_head + 
+                            h_id * block_size * dim_head +
+                            block_offset * dim_head + 
+                            h_offset, 
+                            &k_vec);
 
-        Load<T, VecSize>(cache_v + 
-                        block_idx * num_head * block_size * dim_head + 
-                        h_id * block_size * dim_head +
-                        block_offset * dim_head + 
-                        h_offset, 
-                        &v_vec);
+            Load<T, VecSize>(cache_v + 
+                            block_idx * num_head * block_size * dim_head + 
+                            h_id * block_size * dim_head +
+                            block_offset * dim_head + 
+                            h_offset, 
+                            &v_vec);
 
 
-        Store<T, VecSize>(k_vec, k_out + (base_id + local_token_id) * num_head * dim_head + h_id * dim_head + h_offset);
-        Store<T, VecSize>(v_vec, v_out + (base_id + local_token_id) * num_head * dim_head + h_id * dim_head + h_offset);
+            Store<T, VecSize>(k_vec, k_out + (base_id + local_token_id) * num_head * dim_head + h_id * dim_head + h_offset);
+            Store<T, VecSize>(v_vec, v_out + (base_id + local_token_id) * num_head * dim_head + h_id * dim_head + h_offset);
+        }
     }
+
+    
+    
 }
 
 template <paddle::DataType D>
@@ -177,9 +211,9 @@ std::vector<paddle::Tensor> LaunchMedusaQKVTransposeSplit(const paddle::Tensor& 
     
     MedusaFetchCacheKVKernel<DataType_, PackSize><<<bsz, 512, 0, cu_stream>>>(reinterpret_cast<DataType_*>(k_out.data<data_t>()),
                                                                             reinterpret_cast<DataType_*>(v_out.data<data_t>()),
+                                                                            reinterpret_cast< DataType_*>(const_cast<data_t*>(cache_k.data<data_t>() + layer_id * max_block_nums * num_head * block_size * dim_head)),
+                                                                            reinterpret_cast< DataType_*>(const_cast<data_t*>(cache_v.data<data_t>() + layer_id * max_block_nums * num_head * block_size * dim_head)),
                                                                             block_tables.data<int>(),
-                                                                            reinterpret_cast<const DataType_*>(cache_k.data<data_t>() + layer_id * max_block_nums * num_head * block_size * dim_head),
-                                                                            reinterpret_cast<const DataType_*>(cache_v.data<data_t>() + layer_id * max_block_nums * num_head * block_size * dim_head),
                                                                             seq_lens_decoder.data<int>(),
                                                                             cu_seqlens_k.data<int>(),
                                                                             num_head,

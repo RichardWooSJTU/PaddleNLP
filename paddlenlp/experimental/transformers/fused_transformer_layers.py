@@ -1823,7 +1823,7 @@ class FusedMedusaMultiTransformer(Layer):
                                                                           cu_seqlens_k,
                                                                           padding_offsets, 
                                                                           input_ids,i) # [token_num, num_head, dim_head]
-
+            
             max_seqlen = input_ids.shape[1]
 
             fmha_out = flash_attn_unpadded_with_mask(q_out, k_out, v_out, attn_mask,
@@ -1901,7 +1901,7 @@ class FusedMedusaMultiTransformer(Layer):
 
             # norm + residual_add_bias
             if self.normalize_before is True:
-                if i != len(caches) // 2 - 1:
+                if i != num_layers - 1:
                     norm_out = self.norm_func(
                         ffn2_out,
                         norm_weight=self.ln_scales[i + 1],
