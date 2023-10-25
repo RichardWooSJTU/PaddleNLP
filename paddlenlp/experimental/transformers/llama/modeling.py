@@ -28,6 +28,8 @@ from paddlenlp_ops import (
     medusa_save_output,
     medusa_write_kv,
     medusa_gather,
+    medusa_update_inputs,
+    medusa_update_mask,
 )
 
 from paddlenlp.experimental.transformers.fused_transformer_layers import (
@@ -1498,8 +1500,9 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
         seq_lens_decoder = kwargs["seq_lens_decoder"]
 
         # TODO(@wufeisheng): 实现对src_mask的更新，如果是encoder 设置为casual，否则设为medusa模式
-        # medusa模式需要根据seq_len来更新位置，但是[-medusa_len:]位置的mask为恒定值
-        update_mask(src_mask, seq_lens_encoder, seq_lens_decoder, medusa_mask)
+        # medusa模式即 [medusa_len, src_len]为全0， 后面拼接medusa_mask
+        # medusa_mask : [1, 1, medusa_len, medusa_len] src_mask: [bsz, 1, max_seq_len, max_seq_len]
+        medusa_update_mask(src_mask, seq_lens_encoder, seq_lens_decoder, kwargs["medusa_attn_mask"], mask_value = -1e4)
 
         rope_emb = kwargs["rope_emb"]
         k_quant_scales = kwargs.get("k_quant_scales", None)
@@ -1721,7 +1724,7 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
             # Verifying(@wufeisheng): 实现新的saveoutput 因为encoder不输出token，deocder输出多个token
             medusa_save_output(next_tokens, accept_lengths, insert_index_decoder, model_kwargs["not_need_stop"], self.config.tensor_parallel_rank)
 
-            # TODO(@wufeisheng): cache_k cache_v的更新
+            # VERIFYING(@wufeisheng): cache_k cache_v的更新
             # cache_k/v: [num_layers, max_block_nums, numhead, block_size, dim_head]
             # medusa k/v: [num_layers, bsz, numhead, medusa_len, dim_head]
             # 1. retrieve medusa k/v -> [num_layers, bsz, numhead, num_posterior, self.medusa+1, dim_head]
@@ -1789,7 +1792,7 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
 
         # update input_ids 和其他变量
         # input_ids 对于decoder来说就是tree_candidates[bsz, medusa_len], 对于encoder来说就是正常的输入
-        # TODO(@wufeisheng): 实现新的update
+        # VERIFYING(@wufeisheng): 实现新的update
         medusa_update_inputs(
             model_kwargs["stop_flags"],
             model_kwargs["not_need_stop"],

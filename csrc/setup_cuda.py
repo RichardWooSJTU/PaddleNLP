@@ -58,7 +58,8 @@ setup(
             # "./generation/medusa_save_with_output_msg.cc",
             # "./generation/medusa_write_kv.cu"
             # "./generation/medusa_gather.cu",
-            "./generation/medusa_update_inputs.cu",
+            # "./generation/medusa_update_inputs.cu",
+            "./generation/medusa_update_mask.cu",
         ],
         extra_compile_args={
             "cxx": ["-O3"],
