@@ -178,9 +178,11 @@ std::vector<paddle::Tensor> LaunchMedusaQKVTransposeSplit(const paddle::Tensor& 
     const int dim_head = medusa_k.shape()[4];
     const int medusa_len = medusa_k.shape()[3];
 
+
     const int max_block_nums = cache_k.shape()[1]; 
     const int block_size = cache_k.shape()[3];
     const int pre_max_block_num = block_tables.shape()[1];
+
 
     const int max_seq_len = input_ids.shape()[1];
 
@@ -189,7 +191,7 @@ std::vector<paddle::Tensor> LaunchMedusaQKVTransposeSplit(const paddle::Tensor& 
     auto q_out = paddle::full({token_num, num_head, dim_head}, 0, qkv.dtype(), qkv.place());
     auto k_out = paddle::full({k_token_num, num_head, dim_head}, 0, qkv.dtype(), qkv.place());
     auto v_out = paddle::full({k_token_num, num_head, dim_head}, 0, qkv.dtype(), qkv.place());
-    
+
 
     constexpr int PackSize = VEC_16B / sizeof(DataType_);
 
@@ -208,7 +210,7 @@ std::vector<paddle::Tensor> LaunchMedusaQKVTransposeSplit(const paddle::Tensor& 
                                                                                        medusa_len,
                                                                                        max_seq_len
                                                                                        );
-    
+
     MedusaFetchCacheKVKernel<DataType_, PackSize><<<bsz, 512, 0, cu_stream>>>(reinterpret_cast<DataType_*>(k_out.data<data_t>()),
                                                                             reinterpret_cast<DataType_*>(v_out.data<data_t>()),
                                                                             reinterpret_cast< DataType_*>(const_cast<data_t*>(cache_k.data<data_t>() + layer_id * max_block_nums * num_head * block_size * dim_head)),
@@ -221,6 +223,7 @@ std::vector<paddle::Tensor> LaunchMedusaQKVTransposeSplit(const paddle::Tensor& 
                                                                             pre_max_block_num,
                                                                             block_size
                                                                             );
+    return {q_out, k_out, v_out};
 }
 
 std::vector<paddle::Tensor> MedusaQKVTransposeSplit(const paddle::Tensor& medusa_k,
@@ -236,7 +239,7 @@ std::vector<paddle::Tensor> MedusaQKVTransposeSplit(const paddle::Tensor& medusa
                                                               const paddle::Tensor& padding_offsets,
                                                               const paddle::Tensor& input_ids,
                                                               int layer_id) {
-    switch (qkv.type()) {
+    switch (qkv.dtype()) {
         case paddle::DataType::BFLOAT16: {
             return LaunchMedusaQKVTransposeSplit<paddle::DataType::BFLOAT16>(
                 medusa_k,

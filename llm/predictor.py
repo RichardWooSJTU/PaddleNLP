@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from __future__ import annotations
+from csv import field_size_limit
 
 import json
 import os
@@ -21,6 +22,7 @@ from abc import abstractmethod
 from dataclasses import dataclass, field
 
 import numpy as np
+from pytest import Config
 import paddle
 import paddle.distributed.fleet.base.topology as tp
 from paddle.distributed import fleet
@@ -31,7 +33,10 @@ from utils import (
     get_infer_model_path,
     get_prefix_tuning_params,
     load_real_time_tokens,
+    generate_medusa_buffers,
 )
+
+from medusa_choices import mc_sim_7b_63
 
 from paddlenlp.peft import LoRAConfig, LoRAModel, PrefixConfig, PrefixModelForCausalLM
 from paddlenlp.taskflow.utils import static_mode_guard
@@ -91,6 +96,10 @@ class PredictorArgument:
     use_cachekv_int8: bool = field(
         default=False,
         metadata={"help": "If use_cachekv_int8 set as `True`, dynamic cache kv quantization will be applied"},
+    )
+    medusa: bool = field(
+        default=False,
+        metadata={"help": "If medusa set as `True`, use medusa inference"},
     )
 
 
@@ -649,6 +658,8 @@ class DygraphBlockInferencePredictor(BasePredictor):
         tokenizer: PretrainedTokenizer = None,
     ):
         BasePredictor.__init__(self, config, tokenizer)
+
+        self.model = model
         self.cache_kvs_shape = []
         self.total_max_length = config.src_length + config.max_length
         self.block_size = model.config.block_size
@@ -660,14 +671,17 @@ class DygraphBlockInferencePredictor(BasePredictor):
         self.architectures = self.model_config.architectures[0].lower()
 
         self.dtype = config.dtype or self.model_config
-        if config.use_cachekv_int8:
-            self.cache_kvs = [paddle.zeros(shape, dtype="uint8") for shape in self.cache_kvs_shape]
+        if not config.medusa:
+            if config.use_cachekv_int8:
+                self.cache_kvs = [paddle.zeros(shape, dtype="uint8") for shape in self.cache_kvs_shape]
+            else:
+                self.cache_kvs = [paddle.zeros(shape, dtype=self.dtype) for shape in self.cache_kvs_shape]
+            self.num_attention_heads, self.head_dim = (
+                self.cache_kvs[0].shape[-3],
+                self.cache_kvs[0].shape[-1],
+            )
         else:
-            self.cache_kvs = [paddle.zeros(shape, dtype=self.dtype) for shape in self.cache_kvs_shape]
-        self.num_attention_heads, self.head_dim = (
-            self.cache_kvs[0].shape[-3],
-            self.cache_kvs[0].shape[-1],
-        )
+            self.num_attention_heads, self.head_dim = self.get_num_head(), self.get_head_dim()
         
         self.inputs = {}
         self.pre_cache_length = 0
@@ -703,7 +717,8 @@ class DygraphBlockInferencePredictor(BasePredictor):
             ]
 
         # not update
-        self.inputs["cache_kvs"] = self.cache_kvs
+        if not config.medusa:
+            self.inputs["cache_kvs"] = self.cache_kvs
 
         self.inputs["pre_ids"] = paddle.full([config.batch_size, self.total_max_length], -1, dtype="int64")
         self.inputs["bad_tokens"] = paddle.to_tensor([-1, ], dtype="int64")
@@ -753,7 +768,12 @@ class DygraphBlockInferencePredictor(BasePredictor):
         self.free_list = [i for i in range(self.max_block_nums)][::-1]
         self.used_list = [[] for _ in range(config.batch_size)]
 
-        self.model = model
+
+    def get_head_dim(self):
+        return self.model.config.hidden_size // self.model.config.num_attention_heads
+
+    def get_num_head(self):
+        return self.model.config.num_attention_heads // max(self.model.config.tensor_parallel_degree, 1)
 
     def _get_rotary_position_embedding(self, position_ids, head_dim):
         """
@@ -788,8 +808,11 @@ class DygraphBlockInferencePredictor(BasePredictor):
     @paddle.no_grad()
     def predict(self, input_texts: str | list[str]):
         self._preprocess(input_texts)
+        i = 0 
         while self.inputs["not_need_stop"]:
+            print("generate: ", i)
             self._infer(self.inputs)
+            i += 1
         # reset free_list
         for i in range(self.config.batch_size):
             self.free_list.extend(self.used_list[i])
@@ -824,8 +847,6 @@ class DygraphBlockInferencePredictor(BasePredictor):
                 self.inputs["block_tables"][i : i + 1, bi] = bi_now
 
 
-from .utils import generate_medusa_buffers
-from .medusa_choices import mc_sim_7b_63
 class DygraphMedusaBlockInferencePredictor(DygraphBlockInferencePredictor):
     def __init__(self, config: PredictorArgument, model: PretrainedModel = None, tokenizer: PretrainedTokenizer = None):
         super().__init__(config, model, tokenizer)
@@ -853,6 +874,9 @@ class DygraphMedusaBlockInferencePredictor(DygraphBlockInferencePredictor):
 
         self.inputs["cache_k"] = self.cache_k
         self.inputs["cache_v"] = self.cache_v
+
+        self.inputs["src_mask"] = paddle.zeros([config.batch_size, 1, self.total_max_length, self.total_max_length])
+
 
 
 
@@ -1158,10 +1182,19 @@ def create_predictor(
         config.tensor_parallel_rank = tensor_parallel_rank
         if predictor_args.block_attn:
             if predictor_args.mode == "dynamic":
+                print("config", config)
+                # exit(0)
                 if "llama" in config.architectures[0].lower():
-                    from paddlenlp.experimental.transformers import (
-                        LlamaForCausalLMBlockInferenceModel as LlamaInferenceModel,
-                    )
+                    if predictor_args.medusa:
+                        from paddlenlp.experimental.transformers import (
+                            LlamaForCasualMedusaBlockInferenceModel as LlamaInferenceModel,
+                        )
+                        config.medusa_num_heads = 4
+                        config.medusa_num_layers = 1
+                    else:
+                        from paddlenlp.experimental.transformers import (
+                            LlamaForCausalLMBlockInferenceModel as LlamaInferenceModel,
+                        )
 
                     config.tensor_parallel_degree = tensor_parallel_degree
                     config.tensor_parallel_rank = tensor_parallel_rank
@@ -1178,7 +1211,11 @@ def create_predictor(
                         predictor_args.model_name_or_path, config=config, dtype=predictor_args.dtype
                     )
                     model.eval()
-                predictor = DygraphBlockInferencePredictor(predictor_args, model=model, tokenizer=tokenizer)
+                if predictor_args.medusa:
+                    predictor = DygraphMedusaBlockInferencePredictor(predictor_args, model=model, tokenizer=tokenizer)
+                else:
+                    predictor = DygraphBlockInferencePredictor(predictor_args, model=model, tokenizer=tokenizer)
+
             else:
                 config = AutoConfig.from_pretrained(predictor_args.model_name_or_path)
                 if "llama" in config.architectures[0].lower():
@@ -1193,6 +1230,7 @@ def create_predictor(
                     )
                 predictor = StaticBlockInferencePredictor(predictor_args, cache_kvs_shape, tokenizer=tokenizer)
         elif predictor_args.mode == "dynamic":
+            print("config", config)
             if "llama" in config.architectures[0].lower():
                 if model_args.model_type == "llama-img2txt":
                     # we use llama for img2txt.

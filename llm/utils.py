@@ -696,7 +696,7 @@ def generate_medusa_buffers(medusa_choices):
     retrieve_indices = [pad_path(path, max_length) for path in retrieve_indices_nest]
     retrieve_indices = paddle.to_tensor(retrieve_indices, dtype='int64')
     retrieve_indices = retrieve_indices + 1
-    retrieve_indices = paddle.cat([paddle.zeros((retrieve_indices.shape[0], 1), dtype='int64'), retrieve_indices], dim=1)
+    retrieve_indices = paddle.concat([paddle.zeros((retrieve_indices.shape[0], 1), dtype='int64'), retrieve_indices], axis=1)
 
     # # import pdb;pdb.set_trace()
     # Aggregate the generated buffers into a dictionary

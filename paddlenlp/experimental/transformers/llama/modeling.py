@@ -59,6 +59,7 @@ __all__ = [
     "LlamaForCausalLMInferenceModel",
     "LlamaForCausalLMBlockInferenceModel",
     "LlamaForMiniGPT4InferenceModel",
+    "LlamaForCasualMedusaBlockInferenceModel",
 ]
 
 
@@ -1069,7 +1070,7 @@ class LlamaForCausalLMBlockInferenceModel(GenerationBlockInferenceModel, LlamaPr
 
 
 
-class ResBlock(nn.Module):
+class ResBlock(nn.Layer):
     """
     A Residual Block module.
 
@@ -1080,13 +1081,13 @@ class ResBlock(nn.Module):
         hidden_size (int): The size of the hidden layers in the block.
     """
 
-    def __init__(self, hidden_size):
+    def __init__(self, hidden_size, medusa_idx):
         super().__init__()
         weight_attr = paddle.ParamAttr(
-            name="weight",
+            name="medusa_lm_weight_{}".format(medusa_idx),
             initializer=paddle.nn.initializer.Constant(value=0.0))
         bias_attr = paddle.ParamAttr(
-            name="bias",
+            name="medusa_lm_bias_{}".format(medusa_idx),
             initializer=paddle.nn.initializer.Constant(value=1.0))
         self.linear = paddle.nn.Linear(hidden_size, hidden_size, weight_attr, bias_attr)
         # Initialize as an identity mapping
@@ -1264,6 +1265,7 @@ class LlamaMedusaBlockInferenceModel(LlamaPretrainedModel):
 
     def forward(
         self,
+        input_ids,
         ids_remove_padding=None,
         cum_offsets=None,
         padding_offset=None,
@@ -1312,7 +1314,6 @@ class LlamaMedusaBlockInferenceModel(LlamaPretrainedModel):
                 k_dequant_scales=k_dequant_scales,
                 v_dequant_scales=v_dequant_scales,
                 block_tables=block_tables,
-                block_size=self.block_size,
                 use_neox_rotary_style=self.use_neox_rotary_style,
             )
         hidden_states = self.norm(hidden_states)
@@ -1429,21 +1430,23 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
         self.medusa = config.medusa_num_heads
         self.medusa_num_layers = config.medusa_num_layers
 
-        self.llama = LlamaBlockInferenceModel(config)
+        self.llama = LlamaMedusaBlockInferenceModel(config)
         self.lm_head = LlamaLMHead(config)
 
-        weight_attr = paddle.ParamAttr(
-            name="weight",
+        weight_attrs = [paddle.ParamAttr(
+            name=f"medusa_weight_{i}",
             initializer=paddle.nn.initializer.Constant(value=0.0))
+            for i in range(config.medusa_num_heads)
+        ]
         
 
         self.medusa_head = paddle.nn.LayerList(
             [
                 paddle.nn.Sequential(
-                    *([ResBlock(self.hidden_size)] * config.medusa_num_layers),
-                    paddle.nn.Linear(self.hidden_size, self.vocab_size, weight_attr=weight_attr, bias_attr=False),
+                    *([ResBlock(config.hidden_size, i)] * config.medusa_num_layers),
+                    paddle.nn.Linear(config.hidden_size, config.vocab_size, weight_attr=weight_attrs[i], bias_attr=False),
                 )
-                for _ in range(config.medusa_num_heads)
+                for i in range(config.medusa_num_heads)
             ]
         )
 
@@ -1498,17 +1501,22 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
 
         seq_lens_encoder = kwargs["seq_lens_encoder"]
         seq_lens_decoder = kwargs["seq_lens_decoder"]
+        seq_lens_this_time = kwargs["seq_lens_this_time"]
 
-        # TODO(@wufeisheng): 实现对src_mask的更新，如果是encoder 设置为casual，否则设为medusa模式
+        # VERIFYING(@wufeisheng): 实现对src_mask的更新，如果是encoder 设置为casual，否则设为medusa模式
         # medusa模式即 [medusa_len, src_len]为全0， 后面拼接medusa_mask
         # medusa_mask : [1, 1, medusa_len, medusa_len] src_mask: [bsz, 1, max_seq_len, max_seq_len]
+        print("medusa_mask")
         medusa_update_mask(src_mask, seq_lens_encoder, seq_lens_decoder, kwargs["medusa_attn_mask"], mask_value = -1e4)
+        print("after medusa mask")
 
         rope_emb = kwargs["rope_emb"]
         k_quant_scales = kwargs.get("k_quant_scales", None)
         v_quant_scales = kwargs.get("v_quant_scales", None)
         k_dequant_scales = kwargs.get("k_dequant_scales", None)
         v_dequant_scales = kwargs.get("v_dequant_scales", None)
+        medusa_position_ids = kwargs.get("medusa_position_ids", None)
+
         model_inputs = {
             "input_ids": input_ids,
             "src_mask": src_mask,
@@ -1517,6 +1525,7 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
             "cache_v": cache_v,
             "medusa_k": medusa_k,
             "medusa_v": medusa_v,
+            "seq_lens_this_time":seq_lens_this_time,
             "seq_lens_encoder": seq_lens_encoder,
             "seq_lens_decoder": seq_lens_decoder,
             "block_tables": block_tables,
@@ -1524,11 +1533,12 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
             "v_quant_scales": v_quant_scales,
             "k_dequant_scales": k_dequant_scales,
             "v_dequant_scales": v_dequant_scales,
+            "medusa_position_ids": medusa_position_ids,
         }
         return model_inputs
 
     def remove_padding(self, input_ids, seq_lens_this_time, seq_lens_decoder):
-        cum_offsets_now = paddle.cumsum(self.max_input_length - seq_lens_this_time)
+        cum_offsets_now = paddle.cumsum(self.llama.max_input_length - seq_lens_this_time)
         token_num = paddle.sum(seq_lens_this_time)
         ids_remove_padding, cum_offsets, padding_offset, cu_seqlens_q, cu_seqlens_k = get_padding_offset_v2(
             input_ids, cum_offsets_now, token_num, seq_lens_this_time, seq_lens_decoder
@@ -1558,10 +1568,12 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
     ):
         # Tree decoding: 
         ids_remove_padding, padding_offset, cum_offsets, cu_seqlens_q, cu_seqlens_k = self.remove_padding(
-            input_ids, seq_lens_this_time, seq_lens_encoder, seq_lens_decoder
+            input_ids, seq_lens_this_time, seq_lens_decoder
         )
+        print("after remove padding")
 
         outputs = self.llama(
+            input_ids,
             ids_remove_padding,
             padding_offset=padding_offset,
             cum_offsets=cum_offsets,
@@ -1669,13 +1681,13 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
 
         # import pdb;pdb.set_trace()
         # Combine the selected candidate from the original logits with the topk medusa logits.
-        candidates = paddle.stack([candidates_logit, candidates_medusa_logits], axis=-1) # [bsz, 41]
+        candidates = paddle.concat([candidates_logit, candidates_medusa_logits], axis=-1) # [bsz, 41]
 
         # Map the combined candidates to the tree indices to get tree candidates.
         tree_candidates = candidates[:, tree_indices] # [bsz, medusa_len-1]
 
         # Extend the tree candidates by appending a zero.
-        tree_candidates_ext = paddle.stack([tree_candidates, paddle.zeros((bsz, 1), dtype='int64', device=tree_candidates.device)], axis=-1)
+        tree_candidates_ext = paddle.concat([tree_candidates, paddle.zeros((bsz, 1), dtype='int64', device=tree_candidates.device)], axis=-1)
 
         # Retrieve the cartesian candidates using the retrieve indices.
         cart_candidates = tree_candidates_ext[:, retrieve_indices] # [bsz, num_posterior, self.medusa+1]
@@ -1697,7 +1709,7 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
         min_tokens_to_keep=1,
         **model_kwargs
     ):
-        # print("keys: ", model_kwargs.keys())
+        print("keys: ", model_kwargs.keys())
         def _forward_(**args):
             model_inputs = self.prepare_inputs_for_generation(**args)
             return self(**model_inputs)
@@ -1741,6 +1753,7 @@ class LlamaForCasualMedusaBlockInferenceModel(GenerationMedusaBlockInferenceMode
             return next_tokens
 
         # Tree decoding
+        print("Tree decoding")
         tree_orig_logits, tree_combined_medusa_logits, padding_offset, cum_offsets = _forward_(**model_kwargs)  # [token_num, vocab_size]
 
         # tree_orig_logits [token_num, vocab_size] -> [num_decoders, num_posterior, self.medusa+1, vocab_size]  对于decoder需要确定某一个路径

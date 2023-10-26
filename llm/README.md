@@ -263,11 +263,13 @@ python predictor.py \
 # LoRA需要先合并参数，详见3.7LoRA参数合并
 # Prefix Tuning暂不支持
 python predictor.py \
-    --model_name_or_path checkpoints/llama_sft_ckpts/checkpoint-10 \
+    --model_name_or_path __internal_testing__/tiny-random-llama \
     --dtype float16 \
     --max_length 1024 \
     --mode "dynamic" \
-    --inference_model
+    --inference_model \
+    --medusa \
+    --block_attn
 ```
 
 ### 4.4 InferenceModel 静态图推理

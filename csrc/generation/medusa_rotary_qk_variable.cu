@@ -171,7 +171,7 @@ void MedusaRotaryQKVariable(const paddle::Tensor& qkv,
 
 
 
-PD_BUILD_OP(encode_rotary_qk_variable)
+PD_BUILD_OP(medusa_encode_rotary_qk_variable)
     .Inputs({"qkv", "rotary_emb", "seq_lens_encoder", "seq_lens_decoder", "padding_offsets", "medusa_position_ids"})
     .Outputs({"qkv_out"})
     .SetInplaceMap({{"qkv", "qkv_out"}})

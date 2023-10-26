@@ -38,8 +38,8 @@ if is_paddlenlp_ops_available():
         transpose_remove_padding,
         write_cache_kv,
         write_int8_cache_kv,
-        encode_rotary_qk_variable,
         medusa_qkv_transpose_split_fetch_concat,
+        medusa_encode_rotary_qk_variable,
     )
 else:
     logger.warning(
@@ -1456,7 +1456,8 @@ class FusedMedusaMultiTransformer(Layer):
         else:
             self.norm_func = fused_rms_norm
         self.use_neox_rotary_style = use_neox_rotary_style
-        self._norm_weight_dtype = "float32" if self.norm_type == "layernorm" else self._dtype
+        # self._norm_weight_dtype = "float32" if self.norm_type == "layernorm" else self._dtype
+        self._norm_weight_dtype = "float32"
 
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -1778,13 +1779,17 @@ class FusedMedusaMultiTransformer(Layer):
         ln_out = src
 
         for i in range(num_layers):
-            # print("i: ", i)
+            print("layer i: ", i)
             if self.normalize_before is True:
                 # layernorm
                 if i == 0:
+                    ori_type = src.dtype
+                    src = src.astype(self.ln_scales[i].dtype)
                     ln_out = self.norm_func(
                         src, self.ln_scales[i], self.ln_biases[i], self._epsilon, begin_norm_axis=1
-                    )
+                    )[0]
+                    
+                    ln_out = ln_out.astype(ori_type)
 
             # qkv compute
             if self.use_weight_only:
@@ -1797,10 +1802,12 @@ class FusedMedusaMultiTransformer(Layer):
                 )
             else:
                 qkv_out = self.linear(ln_out, self.qkv_weights[i], self.qkv_biases[i], transpose_weight=True)
-            
+            # print("rotary_embs", rotary_embs)
+            # print("padding_offsets", padding_offsets)
+            # print("medusa_position_ids", medusa_position_ids)
             # fmha
             # VERIFYING(@wufeisheng): implement rotary_qk_variable
-            qkv_out = encode_rotary_qk_variable(qkv_out, # [token_num, 3 * num_head * dim_head]
+            qkv_out = medusa_encode_rotary_qk_variable(qkv_out, # [token_num, 3 * num_head * dim_head]
                                          rotary_embs, #[2, 1, max_seq_len, 1, dim_head / 2]
                                          seq_lens_encoder, # [bs]
                                          seq_lens_decoder, # [bs]
@@ -1808,9 +1815,24 @@ class FusedMedusaMultiTransformer(Layer):
                                          medusa_position_ids, # [bs, medusa_len]
                                          self.num_heads,
                                          use_neox_rotary_style)
-
+            print("after medusa_encode_rotary_qk_variable")
             # fetch and concat 
             # VERIFYING(@wufeisheng): fetch cachekv from blocks and concat with k v if in tree decoding
+
+            import numpy as np 
+            np.save("medusa_k.npy", medusa_k.numpy())
+            np.save("medusa_v.npy", medusa_v.numpy())
+            np.save("qkv_out.npy", qkv_out.numpy())
+            np.save("block_tables.npy", block_tables.numpy())
+            np.save("cache_k.npy", cache_k.numpy())
+            np.save("cache_v.npy", cache_v.numpy())
+            np.save("seq_lens_encoder.npy", seq_lens_encoder.numpy())
+            np.save("seq_lens_decoder.npy", seq_lens_decoder.numpy())
+            np.save("cu_seqlens_q.npy", cu_seqlens_q.numpy())
+            np.save("cu_seqlens_k.npy", cu_seqlens_k.numpy())
+            np.save("padding_offsets.npy", padding_offsets.numpy())
+            np.save("input_ids.npy", input_ids.numpy())
+
             q_out, k_out, v_out = medusa_qkv_transpose_split_fetch_concat(medusa_k, 
                                                                           medusa_v,  
                                                                           qkv_out, 
@@ -1823,8 +1845,10 @@ class FusedMedusaMultiTransformer(Layer):
                                                                           cu_seqlens_k,
                                                                           padding_offsets, 
                                                                           input_ids,i) # [token_num, num_head, dim_head]
-            
+
             max_seqlen = input_ids.shape[1]
+
+            print("after medusa_qkv_transpose_split_fetch_concat")
 
             fmha_out = flash_attn_unpadded_with_mask(q_out, k_out, v_out, attn_mask,
                                         cu_seqlens_q,
@@ -1849,7 +1873,10 @@ class FusedMedusaMultiTransformer(Layer):
                 dist.all_reduce(out_linear_out)
 
             # norm + residual_add_bias
+            ffn_ori_type = out_linear_out.dtype
+            out_linear_out = src.astype(self.ffn_ln_scales[i].dtype)
             if self.normalize_before is True:
+                
                 norm_out = self.norm_func(
                     out_linear_out,
                     norm_weight=self.ffn_ln_scales[i],
@@ -1859,6 +1886,8 @@ class FusedMedusaMultiTransformer(Layer):
                     bias=self.linear_biases[i],
                     residual=bias_residual_input,
                 )
+                norm_out[0]  = norm_out[0].astype(ffn_ori_type)
+                norm_out[1]  = norm_out[1].astype(ffn_ori_type)
                 tmp_out, bias_residual_input = norm_out[0], norm_out[1]
             else:
                 tmp_out = self.norm_func(
@@ -1871,6 +1900,7 @@ class FusedMedusaMultiTransformer(Layer):
                     bias=self.linear_biases[i],
                     residual=ln_out,
                 )[0]
+                tmp_out = tmp_out.astype(ffn_ori_type)
 
             # ffn1 matmul
             if self.use_weight_only:
@@ -1902,6 +1932,8 @@ class FusedMedusaMultiTransformer(Layer):
             # norm + residual_add_bias
             if self.normalize_before is True:
                 if i != num_layers - 1:
+                    post_ori_type = norm_out.dtype
+                    norm_out = src.astype(self.ln_scales[i].dtype)
                     norm_out = self.norm_func(
                         ffn2_out,
                         norm_weight=self.ln_scales[i + 1],
@@ -1912,6 +1944,8 @@ class FusedMedusaMultiTransformer(Layer):
                         residual=bias_residual_input,
                     )
                     tmp_out, bias_residual_input = norm_out[0], norm_out[1]
+                    tmp_out = tmp_out.astype(post_ori_type)
+                    bias_residual_input = bias_residual_input.astype(post_ori_type)
                 else:
                     tmp_out = fused_layer_norm(
                         ffn2_out,
