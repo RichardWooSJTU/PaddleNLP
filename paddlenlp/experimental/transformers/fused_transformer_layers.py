@@ -539,7 +539,7 @@ class FusedMultiTransformer(Layer):
                 if i == 0:
                     ln_out = self.norm_func(
                         src, self.ln_scales[i], self.ln_biases[i], self._epsilon, begin_norm_axis=1
-                    )
+                    )[0]
 
             # qkv compute
             if self.use_weight_only:
@@ -551,10 +551,10 @@ class FusedMultiTransformer(Layer):
                     weight_dtype=self.weight_dtype,
                 )
             elif self.use_fp8:
-                qkv_out = paddle.matmul(ln_out.astype('float8'), self.qkv_weights[i])
+                qkv_out = paddle.matmul(ln_out.astype('float8'), self.qkv_weights[i], transpose_x=False, transpose_y=True)
             else:
                 qkv_out = self.linear(ln_out, self.qkv_weights[i], self.qkv_biases[i], transpose_weight=True)
-
+            print(qkv_out)
             # fmha compute
             if time_step is None:  # context
                 """
@@ -616,7 +616,7 @@ class FusedMultiTransformer(Layer):
                     weight_dtype=self.weight_dtype,
                 )
             elif self.use_fp8:
-                out_linear_out = paddle.matmul(fmha_out.astype('float8'), self.linear_weights[i])
+                out_linear_out = paddle.matmul(fmha_out.astype('float8'), self.linear_weights[i], transpose_x=False, transpose_y=True)
             else:
                 out_linear_out = paddle.matmul(fmha_out, self.linear_weights[i])
 
@@ -646,7 +646,7 @@ class FusedMultiTransformer(Layer):
                     bias=self.linear_biases[i],
                     residual=ln_out,
                 )[0]
-
+            
             # ffn1 matmul
             if self.use_weight_only:
                 ffn1_out = weight_only_linear(
@@ -655,11 +655,14 @@ class FusedMultiTransformer(Layer):
                     weight_scale=self.ffn1_weights_scale[i],
                     weight_dtype=self.weight_dtype,
                 )
+
             elif self.use_fp8:
-                ffn1_out = paddle.matmul(tmp_out.astype('float8'), self.ffn1_weights[i])
+                ffn1_out = paddle.matmul(tmp_out.astype('float8'), self.ffn1_weights[i], transpose_x=False, transpose_y=True)
             else:
                 ffn1_out = paddle.matmul(tmp_out, self.ffn1_weights[i])
             ffn1_out = fused_act_bias_wrapper(ffn1_out, self.ffn1_biases[i], act_method=self.activation)
+
+            print(ffn1_out.shape)
 
             # ffn2 matmul
             if self.use_weight_only:
@@ -670,7 +673,7 @@ class FusedMultiTransformer(Layer):
                     weight_dtype=self.weight_dtype,
                 )
             elif self.use_fp8:
-                ffn2_out = paddle.matmul(ffn1_out.astype('float8'), self.ffn2_weights[i])
+                ffn2_out = paddle.matmul(ffn1_out.astype('float8'), self.ffn2_weights[i], transpose_x=False, transpose_y=True)
             else:
                 ffn2_out = paddle.matmul(ffn1_out, self.ffn2_weights[i])
 
